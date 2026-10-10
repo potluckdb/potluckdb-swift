@@ -1,7 +1,16 @@
 import Foundation
 import PotluckDBRuntime
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
+
+@_silgen_name("potluckdb_internal_storage_callback_active_v1")
+private func nativeStorageCallbackActive() -> UInt32
 
 private enum ABI {
+    static let ok: Int32 = 0
     static let errorCaller: UInt32 = 1
     static let errorTemporary: UInt32 = 2
     static let errorPermanent: UInt32 = 3
@@ -26,8 +35,13 @@ private enum ABI {
     static let syncPushed: UInt32 = 2
     static let syncPulled: UInt32 = 3
     static let syncConflict: UInt32 = 4
+    static let syncFailed: UInt32 = 5
     static let openEncryptionKey: UInt32 = 1
     static let openClientID: UInt32 = 2
+    static let openLicenseKey: UInt32 = 4
+    static let openAnalyticalEngine: UInt32 = 8
+    static let querySQLite: UInt32 = 0
+    static let queryDuckDB: UInt32 = 1
     static let remoteRetention: UInt32 = 1
     static let reencryptSourceKey: UInt32 = 1
     static let reencryptRevision: UInt32 = 2
@@ -40,12 +54,18 @@ public enum ErrorCategory: String, Sendable {
     case `internal`
 }
 
-public struct PotluckDBError: Error, LocalizedError, Sendable {
+public struct PotluckDBError: Error, LocalizedError, Equatable, Sendable {
     public let code: String
     public let category: ErrorCategory
     public let message: String
     public let action: String
-    public let retryAfter: TimeInterval?
+
+    public init(code: String, category: ErrorCategory, message: String, action: String) {
+        self.code = code
+        self.category = category
+        self.message = message
+        self.action = action
+    }
 
     public var errorDescription: String? { message }
     public var recoverySuggestion: String? { action }
@@ -55,8 +75,17 @@ public struct PotluckDBError: Error, LocalizedError, Sendable {
             code: "invalid_argument",
             category: .caller,
             message: message,
-            action: action,
-            retryAfter: nil
+            action: action
+        )
+    }
+
+    fileprivate static func storageUnavailable(_ message: String) -> Self {
+        Self(
+            code: "storage_library_unavailable",
+            category: .permanent,
+            message: message,
+            action: "Ship libpotluckdb_storage beside the program, or set "
+                + "POTLUCKDB_STORAGE_LIBRARY to one already on this machine."
         )
     }
 }
@@ -98,14 +127,15 @@ private func applicationCall(
     potluckdb_error_init_v1(&error)
     let result = body(&error)
     guard result == 0 else {
+        let code = copyString(error.code)
+        let action = code == "analytical_engine_unavailable"
+            ? "Download the platform DuckDB library from https://docs.potluckdb.com/install/swift/#analytics and set OpenOptions.analyticalEngine to its path."
+            : copyString(error.action)
         let translated = PotluckDBError(
-            code: copyString(error.code),
+            code: code,
             category: errorCategory(error.category),
             message: copyString(error.message),
-            action: copyString(error.action),
-            retryAfter: error.has_retry_after != 0
-                ? TimeInterval(error.retry_after_ms) / 1_000
-                : nil
+            action: action
         )
         _ = potluckdb_error_release_v1(&error)
         throw translated
@@ -326,6 +356,9 @@ public struct CheckpointPolicy: Equatable, Sendable {
 
 public struct RetentionPolicy: Equatable, Sendable {
     public static let defaults = try! RetentionPolicy.bounded()
+    /// Keeps every revision until collect runs with a bounded policy.
+    public static let unbounded = Self(keepLast: 0, collectAt: 0)
+    public var isBounded: Bool { keepLast != 0 }
 
     fileprivate let keepLast: UInt64
     fileprivate let collectAt: UInt64
@@ -342,7 +375,7 @@ public struct RetentionPolicy: Equatable, Sendable {
 }
 
 public struct ConnectionOptions: Equatable, Sendable {
-    public static let defaults = try! ConnectionOptions()
+    public static let defaults = ConnectionOptions()
 
     public let timeoutMilliseconds: UInt64
     public let maximumRows: UInt64
@@ -351,25 +384,28 @@ public struct ConnectionOptions: Equatable, Sendable {
 
     public init(
         timeoutMilliseconds: UInt64 = 5_000,
-        maximumRows: UInt64 = 100_000,
+        maximumRows: UInt64 = 1_000_000,
         prefetch: PrefetchPolicy = .automatic(),
         checkpoint: CheckpointPolicy = .automatic()
-    ) throws {
+    ) {
+        self.timeoutMilliseconds = timeoutMilliseconds
+        self.maximumRows = maximumRows
+        self.prefetch = prefetch
+        self.checkpoint = checkpoint
+    }
+
+    func validate() throws {
         guard timeoutMilliseconds <= 86_400_000, maximumRows > 0 else {
             throw PotluckDBError.invalidArgument(
                 "connection timeout or result limit is outside the supported bounds",
                 action: "Use a timeout up to one day and a positive maximumRows."
             )
         }
-        self.timeoutMilliseconds = timeoutMilliseconds
-        self.maximumRows = maximumRows
-        self.prefetch = prefetch
-        self.checkpoint = checkpoint
     }
 }
 
 public struct OpenOptions: Equatable, Sendable {
-    public static let defaults = try! OpenOptions()
+    public static let defaults = OpenOptions()
 
     public let localBudgetBytes: UInt64
     public let minimumLocalBudgetBytes: UInt64
@@ -377,7 +413,20 @@ public struct OpenOptions: Equatable, Sendable {
     public let encryptionKey: Data?
     public let syncPolicy: SyncPolicy
     public let clientID: String?
+    /// Supplies the license key described in contracts/licensing.md#requirements.
+    public let licenseKey: String?
+    public let analyticalEngine: String?
     public let connection: ConnectionOptions
+    /// Receives the outcome of every automatic synchronization attempt of
+    /// a `Database`: `.upToDate`, `.pushed`, `.pulled`, `.conflict` or
+    /// `.failed` carrying the error. The hook is invoked on the
+    /// synchronization thread. Do not call the database from inside it;
+    /// transfer the outcome to the program's own thread. `Database.close()`
+    /// returns after the last invocation. A `Snapshot` never synchronizes,
+    /// so `openRevision` ignores it. Two option values compare equal when
+    /// both carry a hook or neither does; the hooks themselves are not
+    /// compared.
+    public let onSync: (@Sendable (SyncResult) -> Void)?
 
     public init(
         localBudgetBytes: UInt64 = 1_024 * 1_024 * 1_024,
@@ -386,8 +435,39 @@ public struct OpenOptions: Equatable, Sendable {
         encryptionKey: Data? = nil,
         syncPolicy: SyncPolicy = .automatic(),
         clientID: String? = nil,
-        connection: ConnectionOptions = .defaults
-    ) throws {
+        licenseKey: String? = nil,
+        analyticalEngine: String? = nil,
+        connection: ConnectionOptions = .defaults,
+        onSync: (@Sendable (SyncResult) -> Void)? = nil
+    ) {
+        self.localBudgetBytes = localBudgetBytes
+        self.minimumLocalBudgetBytes = minimumLocalBudgetBytes
+        self.localCompactionBytes = localCompactionBytes
+        self.encryptionKey = encryptionKey
+        self.syncPolicy = syncPolicy
+        self.clientID = clientID
+        self.licenseKey = licenseKey
+        self.analyticalEngine = analyticalEngine
+        self.connection = connection
+        self.onSync = onSync
+    }
+
+    public static func == (left: OpenOptions, right: OpenOptions) -> Bool {
+        left.localBudgetBytes == right.localBudgetBytes
+            && left.minimumLocalBudgetBytes == right.minimumLocalBudgetBytes
+            && left.localCompactionBytes == right.localCompactionBytes
+            && left.encryptionKey == right.encryptionKey
+            && left.syncPolicy == right.syncPolicy
+            && left.clientID == right.clientID
+            && left.licenseKey == right.licenseKey
+            && left.analyticalEngine == right.analyticalEngine
+            && left.connection == right.connection
+            && (left.onSync == nil) == (right.onSync == nil)
+    }
+
+    /// Refuses a combination the runtime would refuse, before the call
+    /// that would carry it. Construction itself cannot fail.
+    func validate() throws {
         guard localBudgetBytes >= minimumLocalBudgetBytes else {
             throw PotluckDBError.invalidArgument(
                 "local budget must be at least the minimum local budget",
@@ -418,37 +498,35 @@ public struct OpenOptions: Equatable, Sendable {
                 )
             }
         }
-        self.localBudgetBytes = localBudgetBytes
-        self.minimumLocalBudgetBytes = minimumLocalBudgetBytes
-        self.localCompactionBytes = localCompactionBytes
-        self.encryptionKey = encryptionKey
-        self.syncPolicy = syncPolicy
-        self.clientID = clientID
-        self.connection = connection
+        try connection.validate()
     }
 }
 
 public struct RemoteOptions: Equatable, Sendable {
-    public static let defaults = try! RemoteOptions()
+    public static let defaults = RemoteOptions()
 
     public let readConcurrency: UInt32
     public let writeConcurrency: UInt32
-    public let retention: RetentionPolicy?
+    /// Bounded by default: keep the newest ten revisions, collect once twenty exist.
+    public let retention: RetentionPolicy
 
     public init(
         readConcurrency: UInt32 = 32,
         writeConcurrency: UInt32 = 16,
-        retention: RetentionPolicy? = nil
-    ) throws {
+        retention: RetentionPolicy = .defaults
+    ) {
+        self.readConcurrency = readConcurrency
+        self.writeConcurrency = writeConcurrency
+        self.retention = retention
+    }
+
+    func validate() throws {
         guard (1 ... 256).contains(readConcurrency), (1 ... 128).contains(writeConcurrency) else {
             throw PotluckDBError.invalidArgument(
                 "remote concurrency is outside the supported bounds",
                 action: "Use read concurrency 1 through 256 and write concurrency 1 through 128."
             )
         }
-        self.readConcurrency = readConcurrency
-        self.writeConcurrency = writeConcurrency
-        self.retention = retention
     }
 }
 
@@ -488,8 +566,69 @@ public struct Bindings: Equatable, Sendable {
     }
 }
 
-public typealias Row = [SQLValue]
-public typealias Rows = [Row]
+public enum QueryEngine: Sendable {
+    case sqlite
+    case duckdb
+
+    fileprivate var abiSelector: UInt32 {
+        switch self {
+        case .sqlite: return ABI.querySQLite
+        case .duckdb: return ABI.queryDuckDB
+        }
+    }
+}
+
+/// One result row, readable by position or by column name. A name that
+/// appears twice answers its last position.
+public struct Row: RandomAccessCollection, Equatable, Sendable {
+    /// The column names in select-list order.
+    public let columns: [String]
+    /// The cells in select-list order.
+    public let values: [SQLValue]
+
+    public init(columns: [String], values: [SQLValue]) {
+        self.columns = columns
+        self.values = values
+    }
+
+    public var startIndex: Int { values.startIndex }
+    public var endIndex: Int { values.endIndex }
+    public subscript(position: Int) -> SQLValue { values[position] }
+
+    /// The cell under the named column, or nil when the select list has no
+    /// such column.
+    public subscript(column: String) -> SQLValue? {
+        guard let index = columns.lastIndex(where: { $0.utf8.elementsEqual(column.utf8) }) else { return nil }
+        return values[index]
+    }
+
+    public static func == (left: Row, right: [SQLValue]) -> Bool { left.values == right }
+    public static func != (left: Row, right: [SQLValue]) -> Bool { left.values != right }
+}
+
+/// A query result: the column names of the select list in order, then the
+/// rows.
+public struct Rows: RandomAccessCollection, Equatable, Sendable {
+    /// The column names in select-list order; a name that appears twice is
+    /// listed twice.
+    public let columns: [String]
+    /// The rows in result order.
+    public let rows: [Row]
+
+    public init(columns: [String], values: [[SQLValue]]) {
+        self.columns = columns
+        rows = values.map { Row(columns: columns, values: $0) }
+    }
+
+    public var startIndex: Int { rows.startIndex }
+    public var endIndex: Int { rows.endIndex }
+    public subscript(position: Int) -> Row { rows[position] }
+
+    public static func == (left: Rows, right: [[SQLValue]]) -> Bool {
+        left.rows.map(\.values) == right
+    }
+    public static func != (left: Rows, right: [[SQLValue]]) -> Bool { !(left == right) }
+}
 
 public struct ExecuteResult: Equatable, Sendable {
     public let rowsAffected: Int64
@@ -501,6 +640,10 @@ public enum SyncResult: Equatable, Sendable {
     case pushed(revision: Revision)
     case pulled(revision: Revision, replayed: [String], quarantined: [String])
     case conflict(remoteRevision: Revision?, reason: String)
+    /// An automatic attempt that failed, carrying the error `Database.sync()`
+    /// would have thrown. Only `OpenOptions.onSync` delivers it: `sync()`
+    /// throws the error itself.
+    case failed(error: PotluckDBError)
 }
 
 public struct ConflictResolution: Equatable, Sendable {
@@ -645,9 +788,14 @@ private func rawConnectionOptions(
 
 private func withRawOpenOptions<T>(
     _ source: OpenOptions,
+    hook: SyncHook?,
     _ body: (UnsafePointer<PotluckDbOpenOptionsV1>) throws -> T
 ) throws -> T {
-    func invoke(_ clientID: PotluckDbSliceV1?) throws -> T {
+    try source.validate()
+    func invoke(
+        _ clientID: PotluckDbSliceV1?, _ licenseKey: PotluckDbSliceV1?,
+        _ analyticalEngine: PotluckDbSliceV1?
+    ) throws -> T {
         var value = PotluckDbOpenOptionsV1()
         potluckdb_open_options_init_v1(&value)
         value.local_budget_bytes = source.localBudgetBytes
@@ -655,6 +803,10 @@ private func withRawOpenOptions<T>(
         value.local_compaction_bytes = source.localCompactionBytes
         value.sync_policy = rawSyncPolicy(source.syncPolicy)
         value.connection = rawConnectionOptions(source.connection)
+        if let hook {
+            value.on_sync = deliverSync
+            value.on_sync_context = hook.context
+        }
         if let key = source.encryptionKey {
             value.flags |= ABI.openEncryptionKey
             _ = withUnsafeMutableBytes(of: &value.encryption_key) { destination in
@@ -665,13 +817,37 @@ private func withRawOpenOptions<T>(
             value.flags |= ABI.openClientID
             value.client_id = clientID
         }
+        if let licenseKey {
+            value.flags |= ABI.openLicenseKey
+            value.license_key = licenseKey
+        }
+        if let analyticalEngine {
+            value.flags |= ABI.openAnalyticalEngine
+            value.analytical_engine = analyticalEngine
+        }
         return try withUnsafePointer(to: &value, body)
     }
 
-    if let clientID = source.clientID {
-        return try withSlice(clientID) { slice in try invoke(slice) }
+    func withAnalyticalEngine(
+        _ clientID: PotluckDbSliceV1?, _ licenseKey: PotluckDbSliceV1?
+    ) throws -> T {
+        if let selection = source.analyticalEngine {
+            return try withSlice(selection) { slice in try invoke(clientID, licenseKey, slice) }
+        }
+        return try invoke(clientID, licenseKey, nil)
     }
-    return try invoke(nil)
+
+    func withLicenseKey(_ clientID: PotluckDbSliceV1?) throws -> T {
+        if let licenseKey = source.licenseKey {
+            return try withSlice(licenseKey) { slice in try withAnalyticalEngine(clientID, slice) }
+        }
+        return try withAnalyticalEngine(clientID, nil)
+    }
+
+    if let clientID = source.clientID {
+        return try withSlice(clientID) { slice in try withLicenseKey(slice) }
+    }
+    return try withLicenseKey(nil)
 }
 
 private func rawRetentionPolicy(_ source: RetentionPolicy) -> PotluckDbRetentionPolicyV1 {
@@ -687,9 +863,10 @@ private func rawRemoteOptions(_ source: RemoteOptions) -> PotluckDbRemoteOptions
     potluckdb_remote_options_init_v1(&value)
     value.read_concurrency = source.readConcurrency
     value.write_concurrency = source.writeConcurrency
-    if let retention = source.retention {
+    value.flags &= ~ABI.remoteRetention
+    if source.retention.isBounded {
         value.flags |= ABI.remoteRetention
-        value.retention = rawRetentionPolicy(retention)
+        value.retention = rawRetentionPolicy(source.retention)
     }
     return value
 }
@@ -785,8 +962,7 @@ private func internalFailure(_ message: String) -> PotluckDBError {
         code: "internal_failure",
         category: .internal,
         message: message,
-        action: "Preserve the failure details and report this error.",
-        retryAfter: nil
+        action: "Preserve the failure details and report this error."
     )
 }
 
@@ -807,18 +983,36 @@ private func copiedRows(_ handle: PotluckDbRowsHandleV1) throws -> Rows {
     defer {
         if !released { _ = potluckdb_rows_release_v1(handle, nil) }
     }
+    var nameCount: UInt64 = 0
+    try applicationCall { error in
+        potluckdb_rows_column_name_count_v1(handle, &nameCount, error)
+    }
+    var columns: [String] = []
+    columns.reserveCapacity(Int(nameCount))
+    for column in 0 ..< nameCount {
+        var name = PotluckDbSliceV1()
+        try applicationCall { error in
+            potluckdb_rows_column_name_v1(handle, column, &name, error)
+        }
+        columns.append(
+            String(
+                decoding: UnsafeBufferPointer(start: name.data, count: Int(name.length)),
+                as: UTF8.self
+            )
+        )
+    }
     var rowCount: UInt64 = 0
     try applicationCall { error in
         potluckdb_rows_row_count_v1(handle, &rowCount, error)
     }
-    var rows: Rows = []
+    var rows: [[SQLValue]] = []
     rows.reserveCapacity(Int(rowCount))
     for rowIndex in 0 ..< rowCount {
         var columnCount: UInt64 = 0
         try applicationCall { error in
             potluckdb_rows_column_count_v1(handle, rowIndex, &columnCount, error)
         }
-        var row: Row = []
+        var row: [SQLValue] = []
         row.reserveCapacity(Int(columnCount))
         for columnIndex in 0 ..< columnCount {
             var value = PotluckDbValueV1()
@@ -839,7 +1033,7 @@ private func copiedRows(_ handle: PotluckDbRowsHandleV1) throws -> Rows {
     }
     try applicationCall { error in potluckdb_rows_release_v1(handle, error) }
     released = true
-    return rows
+    return Rows(columns: columns, values: rows)
 }
 
 private func executeResult(_ source: PotluckDbExecuteResultV1) -> ExecuteResult {
@@ -978,6 +1172,10 @@ private final class HandleState {
     private let releaseFunction: OwnerFunction
     private var retained: AnyObject?
     private var closed = false
+    // afterClose runs only after a successful close or release. A storage-library adapter is given
+    // back here: the runtime keeps the table's context for the life of
+    // the exchange, so the adapter must not go back before close.
+    fileprivate var afterClose: (() -> Void)?
 
     init(
         handle: UInt64,
@@ -995,12 +1193,35 @@ private final class HandleState {
     }
 
     deinit {
+        if !cleanup() { orphanBorrowers() }
+    }
+
+    fileprivate func cleanup() -> Bool {
+        if nativeStorageCallbackActive() != 0 { return false }
         lock.lock()
         defer { lock.unlock() }
-        guard handle != 0 else { return }
-        if let closeFunction, !closed { _ = closeFunction(handle, nil) }
-        _ = releaseFunction(handle, nil)
-        handle = 0
+        if handle != 0 {
+            if let closeFunction, !closed, closeFunction(handle, nil) != ABI.ok {
+                return false
+            }
+            let result = releaseFunction(handle, nil)
+            if result != ABI.ok && closeFunction != nil {
+                return false
+            }
+            handle = 0
+            retained = nil
+        }
+        runAfterCloseLocked()
+        return true
+    }
+
+    private static let orphanLock = NSLock()
+    private static var orphanedBorrowers: [(AnyObject?, (() -> Void)?)] = []
+
+    private func orphanBorrowers() {
+        Self.orphanLock.lock()
+        defer { Self.orphanLock.unlock() }
+        Self.orphanedBorrowers.append((retained, afterClose))
     }
 
     func withHandle<T>(_ body: (UInt64) throws -> T) throws -> T {
@@ -1011,14 +1232,18 @@ private final class HandleState {
                 code: "invalid_state",
                 category: .caller,
                 message: "potluckdb owner is released",
-                action: "Open a new owner and retry.",
-                retryAfter: nil
+                action: "Open a new owner and retry."
             )
         }
         return try body(handle)
     }
 
     func close() throws {
+        if nativeStorageCallbackActive() != 0 {
+            throw PotluckDBError(code: "invalid_state", category: .caller,
+                                message: "recursive close from a storage callback is refused",
+                                action: "Close the owner after the callback returns.")
+        }
         lock.lock()
         defer { lock.unlock() }
         guard handle != 0, !closed else { return }
@@ -1027,15 +1252,29 @@ private final class HandleState {
         }
         try applicationCall { error in closeFunction(handle, error) }
         closed = true
+        runAfterCloseLocked()
+    }
+
+    fileprivate func runAfterCloseLocked() {
+        let action = afterClose
+        afterClose = nil
+        action?()
     }
 
     func release() throws {
         lock.lock()
         defer { lock.unlock() }
         guard handle != 0 else { return }
+        var consumed = false
+        defer {
+            if consumed || closeFunction == nil {
+                handle = 0
+                retained = nil
+                runAfterCloseLocked()
+            }
+        }
         try applicationCall { error in releaseFunction(handle, error) }
-        handle = 0
-        retained = nil
+        consumed = true
     }
 
     static func withPair<T>(
@@ -1064,8 +1303,7 @@ private final class HandleState {
                 code: "invalid_state",
                 category: .caller,
                 message: "potluckdb Remote is released",
-                action: "Open new Remote values and retry.",
-                retryAfter: nil
+                action: "Open new Remote values and retry."
             )
         }
         return try body(left.handle, right.handle)
@@ -1113,6 +1351,7 @@ public final class Remote {
         _ path: String,
         options: RemoteOptions = .defaults
     ) throws -> Remote {
+        try options.validate()
         var rawOptions = rawRemoteOptions(options)
         return try withSlice(path) { pathSlice in
             var handle: PotluckDbRemoteHandleV1 = 0
@@ -1138,6 +1377,7 @@ public final class Remote {
         _ storage: Integrator.StorageAdapter,
         options: RemoteOptions = .defaults
     ) throws -> Remote {
+        try options.validate()
         var rawOptions = rawRemoteOptions(options)
         return try storage.withRaw { rawStorage in
             var handle: PotluckDbRemoteHandleV1 = 0
@@ -1184,7 +1424,13 @@ public final class Remote {
     }
 
     @discardableResult
-    public func collect(_ retention: RetentionPolicy = .defaults) throws -> CollectionReport {
+    public func collect(_ retention: RetentionPolicy) throws -> CollectionReport {
+        guard retention.isBounded else {
+            throw PotluckDBError.invalidArgument(
+                "collect needs a bounded retention policy",
+                action: "Pass RetentionPolicy.bounded()."
+            )
+        }
         var rawRetention = rawRetentionPolicy(retention)
         return try state.withHandle { handle in
             var output = PotluckDbCollectionReportV1()
@@ -1248,17 +1494,22 @@ public final class Transaction {
         self.state = state
     }
 
-    public func query(_ sql: String, bindings: Bindings = .none) throws -> Rows {
+    public func query(
+        _ sql: String,
+        _ bindings: Bindings = .none,
+        engine: QueryEngine = .sqlite
+    ) throws -> Rows {
         let rawBindings = RawBindings(bindings)
         return try state.withHandle { handle in
             try withSlice(sql) { sqlSlice in
                 try rawBindings.withPointer { bindingsPointer in
                     var rows: PotluckDbRowsHandleV1 = 0
                     try applicationCall { error in
-                        potluckdb_transaction_query_v1(
+                        potluckdb_transaction_query_with_engine_v1(
                             handle,
                             sqlSlice,
                             bindingsPointer,
+                            engine.abiSelector,
                             &rows,
                             error
                         )
@@ -1272,7 +1523,7 @@ public final class Transaction {
     @discardableResult
     public func execute(
         _ sql: String,
-        bindings: Bindings = .none
+        _ bindings: Bindings = .none
     ) throws -> ExecuteResult {
         let rawBindings = RawBindings(bindings)
         return try state.withHandle { handle in
@@ -1362,17 +1613,22 @@ public final class Connection {
         self.state = state
     }
 
-    public func query(_ sql: String, bindings: Bindings = .none) throws -> Rows {
+    public func query(
+        _ sql: String,
+        _ bindings: Bindings = .none,
+        engine: QueryEngine = .sqlite
+    ) throws -> Rows {
         let rawBindings = RawBindings(bindings)
         return try state.withHandle { handle in
             try withSlice(sql) { sqlSlice in
                 try rawBindings.withPointer { bindingsPointer in
                     var rows: PotluckDbRowsHandleV1 = 0
                     try applicationCall { error in
-                        potluckdb_connection_query_v1(
+                        potluckdb_connection_query_with_engine_v1(
                             handle,
                             sqlSlice,
                             bindingsPointer,
+                            engine.abiSelector,
                             &rows,
                             error
                         )
@@ -1386,7 +1642,7 @@ public final class Connection {
     @discardableResult
     public func execute(
         _ sql: String,
-        bindings: Bindings = .none
+        _ bindings: Bindings = .none
     ) throws -> ExecuteResult {
         let rawBindings = RawBindings(bindings)
         return try state.withHandle { handle in
@@ -1480,17 +1736,22 @@ public final class Snapshot {
         self.state = state
     }
 
-    public func query(_ sql: String, bindings: Bindings = .none) throws -> Rows {
+    public func query(
+        _ sql: String,
+        _ bindings: Bindings = .none,
+        engine: QueryEngine = .sqlite
+    ) throws -> Rows {
         let rawBindings = RawBindings(bindings)
         return try state.withHandle { handle in
             try withSlice(sql) { sqlSlice in
                 try rawBindings.withPointer { bindingsPointer in
                     var rows: PotluckDbRowsHandleV1 = 0
                     try applicationCall { error in
-                        potluckdb_snapshot_query_v1(
+                        potluckdb_snapshot_query_with_engine_v1(
                             handle,
                             sqlSlice,
                             bindingsPointer,
+                            engine.abiSelector,
                             &rows,
                             error
                         )
@@ -1533,17 +1794,22 @@ public final class Database {
         self.state = state
     }
 
-    public func query(_ sql: String, bindings: Bindings = .none) throws -> Rows {
+    public func query(
+        _ sql: String,
+        _ bindings: Bindings = .none,
+        engine: QueryEngine = .sqlite
+    ) throws -> Rows {
         let rawBindings = RawBindings(bindings)
         return try state.withHandle { handle in
             try withSlice(sql) { sqlSlice in
                 try rawBindings.withPointer { bindingsPointer in
                     var rows: PotluckDbRowsHandleV1 = 0
                     try applicationCall { error in
-                        potluckdb_database_query_v1(
+                        potluckdb_database_query_with_engine_v1(
                             handle,
                             sqlSlice,
                             bindingsPointer,
+                            engine.abiSelector,
                             &rows,
                             error
                         )
@@ -1557,7 +1823,7 @@ public final class Database {
     @discardableResult
     public func execute(
         _ sql: String,
-        bindings: Bindings = .none
+        _ bindings: Bindings = .none
     ) throws -> ExecuteResult {
         let rawBindings = RawBindings(bindings)
         return try state.withHandle { handle in
@@ -1595,6 +1861,7 @@ public final class Database {
     }
 
     public func connect(_ options: ConnectionOptions = .defaults) throws -> Connection {
+        try options.validate()
         var rawOptions = rawConnectionOptions(options)
         return try state.withHandle { handle in
             var output: PotluckDbConnectionHandleV1 = 0
@@ -1625,33 +1892,7 @@ public final class Database {
                 )
             }
             defer { _ = potluckdb_sync_result_release_v1(&output) }
-            switch output.kind {
-            case ABI.syncUpToDate:
-                return .upToDate(
-                    revision: output.has_revision != 0
-                        ? Revision(raw: output.revision)
-                        : nil
-                )
-            case ABI.syncPushed:
-                return .pushed(revision: Revision(raw: output.revision))
-            case ABI.syncPulled:
-                return .pulled(
-                    revision: Revision(raw: output.revision),
-                    replayed: try strings(output.replayed),
-                    quarantined: try strings(output.quarantined)
-                )
-            case ABI.syncConflict:
-                return .conflict(
-                    remoteRevision: output.has_revision != 0
-                        ? Revision(raw: output.revision)
-                        : nil,
-                    reason: copyString(output.reason)
-                )
-            default:
-                throw internalFailure(
-                    "potluckdb returned an unknown synchronization result"
-                )
-            }
+            return try syncResult(output)
         }
     }
 
@@ -1729,8 +1970,94 @@ public final class Database {
     }
 }
 
+/// The facade's reading of one raw synchronization outcome. The raw value
+/// stays with its owner; the caller releases it.
+private func syncResult(_ output: PotluckDbSyncResultV1) throws -> SyncResult {
+    switch output.kind {
+    case ABI.syncUpToDate:
+        return .upToDate(
+            revision: output.has_revision != 0 ? Revision(raw: output.revision) : nil
+        )
+    case ABI.syncPushed:
+        return .pushed(revision: Revision(raw: output.revision))
+    case ABI.syncPulled:
+        return .pulled(
+            revision: Revision(raw: output.revision),
+            replayed: try strings(output.replayed),
+            quarantined: try strings(output.quarantined)
+        )
+    case ABI.syncConflict:
+        return .conflict(
+            remoteRevision: output.has_revision != 0 ? Revision(raw: output.revision) : nil,
+            reason: copyString(output.reason)
+        )
+    case ABI.syncFailed:
+        return .failed(
+            error: PotluckDBError(
+                code: copyString(output.error.code),
+                category: errorCategory(output.error.category),
+                message: copyString(output.error.message),
+                action: copyString(output.error.action)
+            )
+        )
+    default:
+        throw internalFailure("potluckdb returned an unknown synchronization result")
+    }
+}
+
+/// The registered `OpenOptions.onSync`. The database that registered it
+/// keeps it alive until its handle is released; the runtime returns from
+/// close only after the hook's last invocation.
+private final class SyncHook {
+    let hook: @Sendable (SyncResult) -> Void
+
+    init(_ hook: @escaping @Sendable (SyncResult) -> Void) {
+        self.hook = hook
+    }
+
+    static func from(_ options: OpenOptions) -> SyncHook? {
+        options.onSync.map { SyncHook($0) }
+    }
+
+    var context: UnsafeMutableRawPointer {
+        Unmanaged.passUnretained(self).toOpaque()
+    }
+}
+
+/// What a database opened against a remote keeps alive: the remote's
+/// handle state and the hook it registered, if any.
+private final class DatabaseRetention {
+    let remote: HandleState
+    let hook: SyncHook?
+
+    init(remote: HandleState, hook: SyncHook?) {
+        self.remote = remote
+        self.hook = hook
+    }
+}
+
+/// `PotluckDbOnSyncV1`. An outcome the facade cannot read is delivered as
+/// `.failed` carrying the facade's error.
+private func deliverSync(
+    _ context: UnsafeMutableRawPointer?, _ outcome: PotluckDbSyncResultV1
+) {
+    var raw = outcome
+    let result: SyncResult
+    do {
+        result = try syncResult(raw)
+    } catch let error as PotluckDBError {
+        result = .failed(error: error)
+    } catch {
+        result = .failed(error: internalFailure("\(error)"))
+    }
+    _ = potluckdb_sync_result_release_v1(&raw)
+    guard let context else { return }
+    Unmanaged<SyncHook>.fromOpaque(context).takeUnretainedValue().hook(result)
+}
+
 public func open(_ path: String, options: OpenOptions = .defaults) throws -> Database {
-    try withRawOpenOptions(options) { rawOptions in
+    let hook = SyncHook.from(options)
+    return try withRawOpenOptions(options, hook: hook) { rawOptions in
         try withSlice(path) { pathSlice in
             var output: PotluckDbDatabaseHandleV1 = 0
             try applicationCall { error in
@@ -1740,7 +2067,8 @@ public func open(_ path: String, options: OpenOptions = .defaults) throws -> Dat
                 state: try HandleState(
                     handle: output,
                     close: potluckdb_database_close_v1,
-                    release: potluckdb_database_release_v1
+                    release: potluckdb_database_release_v1,
+                    retained: hook
                 )
             )
         }
@@ -1752,7 +2080,8 @@ public func open(
     remote: Remote,
     options: OpenOptions = .defaults
 ) throws -> Database {
-    try withRawOpenOptions(options) { rawOptions in
+    let hook = SyncHook.from(options)
+    return try withRawOpenOptions(options, hook: hook) { rawOptions in
         try withSlice(path) { pathSlice in
             try remote.state.withHandle { remoteHandle in
                 var output: PotluckDbDatabaseHandleV1 = 0
@@ -1770,7 +2099,7 @@ public func open(
                         handle: output,
                         close: potluckdb_database_close_v1,
                         release: potluckdb_database_release_v1,
-                        retained: remote.state
+                        retained: DatabaseRetention(remote: remote.state, hook: hook)
                     )
                 )
             }
@@ -1785,7 +2114,7 @@ public func openRevision(
     options: OpenOptions = .defaults
 ) throws -> Snapshot {
     var rawRevision = revision.raw
-    return try withRawOpenOptions(options) { rawOptions in
+    return try withRawOpenOptions(options, hook: nil) { rawOptions in
         try withSlice(path) { pathSlice in
             try remote.state.withHandle { remoteHandle in
                 var output: PotluckDbSnapshotHandleV1 = 0
@@ -1874,5 +2203,1199 @@ public enum Admin {
                 published: output.published != 0
             )
         }
+    }
+}
+
+// MARK: - The Seam-4 bucket bridge
+//
+// Remote.fromStorage used to take a pointer to a native
+// PotluckDbRuntimeBucketAdapterV1 that nothing in this SDK could build.
+// What follows fills one in from a BucketStorage, so an application
+// implements the protocol and hands that over instead.
+
+/// An observational Seam-4 adapter-counter snapshot.
+///
+/// B12 separates the logical operations the seam names from the provider
+/// API calls they cause. No counter measures physical object versions or
+/// reclaimed storage bytes.
+public struct BucketCounterSnapshot: Equatable, Sendable {
+    public var gets: UInt64
+    public var puts: UInt64
+    public var idempotentPuts: UInt64
+    public var exists: UInt64
+    public var lists: UInt64
+    public var deletes: UInt64
+    public var cellGets: UInt64
+    public var cellSwaps: UInt64
+    public var cellSwapWins: UInt64
+    public var transportGets: UInt64
+    public var transportPuts: UInt64
+    public var transportHeads: UInt64
+    public var transportLists: UInt64
+    public var transportDeletes: UInt64
+    public var transportBytesReceived: UInt64
+    public var transportBytesSubmitted: UInt64
+
+    public init(
+        gets: UInt64 = 0,
+        puts: UInt64 = 0,
+        idempotentPuts: UInt64 = 0,
+        exists: UInt64 = 0,
+        lists: UInt64 = 0,
+        deletes: UInt64 = 0,
+        cellGets: UInt64 = 0,
+        cellSwaps: UInt64 = 0,
+        cellSwapWins: UInt64 = 0,
+        transportGets: UInt64 = 0,
+        transportPuts: UInt64 = 0,
+        transportHeads: UInt64 = 0,
+        transportLists: UInt64 = 0,
+        transportDeletes: UInt64 = 0,
+        transportBytesReceived: UInt64 = 0,
+        transportBytesSubmitted: UInt64 = 0
+    ) {
+        self.gets = gets
+        self.puts = puts
+        self.idempotentPuts = idempotentPuts
+        self.exists = exists
+        self.lists = lists
+        self.deletes = deletes
+        self.cellGets = cellGets
+        self.cellSwaps = cellSwaps
+        self.cellSwapWins = cellSwapWins
+        self.transportGets = transportGets
+        self.transportPuts = transportPuts
+        self.transportHeads = transportHeads
+        self.transportLists = transportLists
+        self.transportDeletes = transportDeletes
+        self.transportBytesReceived = transportBytesReceived
+        self.transportBytesSubmitted = transportBytesSubmitted
+    }
+}
+
+/// One head-and-floor observation, as Seam 4 B13 defines it. A nil value
+/// is an absent cell. The two reads overlap but are still two reads: the
+/// pair is a finite concurrent observation, never an atomic snapshot.
+public struct CellPair: Equatable, Sendable {
+    public var head: [UInt8]?
+    public var floor: [UInt8]?
+
+    public init(head: [UInt8]?, floor: [UInt8]?) {
+        self.head = head
+        self.floor = floor
+    }
+}
+
+/// One Seam-4 bucket: immutable objects plus the head and floor
+/// compare-and-swap cells.
+///
+/// Threading. B10 and B11 let immutable `get` and `put` calls overlap on
+/// one instance, so every member must be safe for concurrent use. Mutable
+/// cell calls stay on the exchange caller, and a callback may arrive on
+/// any runtime worker thread.
+///
+/// Failures. Throw `PotluckDBError` carrying one of the seam's codes --
+/// `missing`, `conflict`, `unavailable`, or `contract_violation` -- and
+/// the runtime receives that classification with the message intact. Any
+/// other error becomes `internal_failure`: guessing `unavailable` would
+/// read as a transport problem the caller could retry, and guessing
+/// `missing` would read as a satisfied absence.
+///
+/// Lifetime. The runtime copies the callback table but never owns the
+/// implementor. It stays referenced by the `Remote` that borrowed it, and
+/// callbacks may arrive until that Remote is released.
+public protocol BucketStorage: AnyObject {
+    /// Read an immutable object; absent is `missing`.
+    func get(_ key: String) throws -> [UInt8]
+    /// Create an object, or verify that it already agrees.
+    func put(_ key: String, data: [UInt8]) throws
+    /// Whether an immutable object exists.
+    func exists(_ key: String) throws -> Bool
+    /// Matching logical object keys, in lexical order.
+    func list(_ prefix: String) throws -> [String]
+    /// Make an object logically absent; an already absent object succeeds.
+    func delete(_ key: String) throws
+    /// Read the head cell; absent is `missing`.
+    func headGet() throws -> [UInt8]
+    /// Replace the head only when it equals `expected`; nil is absence.
+    func headSwap(expected: [UInt8]?, value: [UInt8]) throws -> Bool
+    /// Read the retention-floor cell; absent is `missing`.
+    func floorGet() throws -> [UInt8]
+    /// Replace the floor only when it equals `expected`; nil is absence.
+    func floorSwap(expected: [UInt8]?, value: [UInt8]) throws -> Bool
+    /// An observational Seam-4 counter snapshot.
+    func counters() -> BucketCounterSnapshot
+}
+
+/// The optional B13 capability: head and floor as one finite concurrent
+/// observation. Conforming declares it; a bucket that does not conform
+/// gets the serial `headGet` then `floorGet` fallback.
+public protocol CellPairBucketStorage: BucketStorage {
+    func cellPairGet() throws -> CellPair
+}
+
+private enum Seam {
+    static let ok: Int32 = 0
+    static let internalFailure: Int32 = 1
+    static let contractViolation: Int32 = 18
+    static let abiVersion: UInt32 = 1
+
+    /// The Runtime Interface error codes, by the name the runtime gives
+    /// them. B5 names four: `missing`, `conflict`, `unavailable`, and
+    /// `contract_violation` for a bucket answering outside its interface.
+    static let codes: [String: Int32] = [
+        "internal_failure": 1,
+        "missing": 2,
+        "storage_full": 3,
+        "storage_unavailable": 4,
+        "integrity_error": 5,
+        "conflict": 6,
+        "unavailable": 7,
+        "format_version_unsupported": 8,
+        "key_required": 9,
+        "wrong_key_or_corrupt": 10,
+        "remote_read_required": 11,
+        "read_only_revision": 12,
+        "history_retired": 13,
+        "sync_deferred": 14,
+        "write_capacity_exceeded": 15,
+        "budget_refused": 16,
+        "identity_refused": 17,
+        "contract_violation": 18,
+        "identity_collision": 19,
+        "sqlite_error": 20,
+        "execution_engine_error": 21,
+        "storage_unsupported": 23,
+        "bucket_not_found": 24,
+    ]
+}
+
+/// The managed half of the bridge: one implementor and its retained
+/// host-error messages.
+private final class BucketBridge {
+    let storage: BucketStorage
+    let pair: CellPairBucketStorage?
+
+    /// How many distinct host-error messages one adapter retains. The
+    /// Application ABI requires a message to stay immutable through the
+    /// enclosing ABI call, and callbacks that overlap have no earlier
+    /// reclamation point than the adapter itself.
+    private static let messageLimit = 4_096
+    private static let messageOverflow =
+        "bucket adapter error message retention limit reached"
+
+    private let lock = NSLock()
+    private var messages: [[UInt8]: (pointer: UnsafeMutableRawPointer, length: Int)] = [:]
+
+    init(storage: BucketStorage) {
+        self.storage = storage
+        pair = storage as? CellPairBucketStorage
+    }
+
+    /// One retained copy, reused when the same message returns.
+    func retain(_ message: String) -> (pointer: UnsafeMutableRawPointer, length: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        var bytes = Array(message.utf8)
+        if messages[bytes] == nil, messages.count >= Self.messageLimit {
+            bytes = Array(Self.messageOverflow.utf8)
+        }
+        if let held = messages[bytes] { return held }
+        let copy = UnsafeMutableRawPointer.allocate(
+            byteCount: max(bytes.count, 1),
+            alignment: 1
+        )
+        bytes.withUnsafeBufferPointer { buffer in
+            if let base = buffer.baseAddress {
+                copy.copyMemory(from: base, byteCount: buffer.count)
+            }
+        }
+        let held = (pointer: copy, length: bytes.count)
+        messages[bytes] = held
+        return held
+    }
+
+    func releaseMessages() {
+        lock.lock()
+        defer { lock.unlock() }
+        for held in messages.values { held.pointer.deallocate() }
+        messages.removeAll()
+    }
+}
+
+/// The adapter table and everything it points at.
+///
+/// A `Remote` retains this; the handle's `deinit` closes and releases the
+/// native exchange before its retained values are dropped, so the table is
+/// freed only once nothing can call back through it.
+private final class BucketAdapterOwner {
+    let bridge: BucketBridge
+    let table: UnsafeMutablePointer<PotluckDbRuntimeBucketAdapterV1>
+
+    init(storage: BucketStorage) {
+        let bridge = BucketBridge(storage: storage)
+        self.bridge = bridge
+        table = UnsafeMutablePointer<PotluckDbRuntimeBucketAdapterV1>.allocate(capacity: 1)
+        table.initialize(to: PotluckDbRuntimeBucketAdapterV1())
+        // Filled in rather than initialized through the Runtime Interface:
+        // an application SDK calls the Application ABI and nothing below it.
+        table.pointee.struct_size = UInt32(
+            MemoryLayout<PotluckDbRuntimeBucketAdapterV1>.size
+        )
+        table.pointee.abi_version = Seam.abiVersion
+        table.pointee.context = Unmanaged.passUnretained(bridge).toOpaque()
+        table.pointee.get = bucketGet
+        table.pointee.put = bucketPut
+        table.pointee.exists = bucketExists
+        table.pointee.list = bucketList
+        table.pointee.delete_value = bucketDelete
+        table.pointee.head_get = bucketHeadGet
+        table.pointee.head_swap = bucketHeadSwap
+        table.pointee.floor_get = bucketFloorGet
+        table.pointee.floor_swap = bucketFloorSwap
+        table.pointee.cell_pair_get = bridge.pair == nil ? nil : bucketCellPairGet
+        table.pointee.counters = bucketCounters
+    }
+
+    deinit {
+        bridge.releaseMessages()
+        table.deinitialize(count: 1)
+        table.deallocate()
+    }
+}
+
+private func bucketBridge(_ context: UnsafeMutableRawPointer?) -> BucketBridge? {
+    guard let context else { return nil }
+    return Unmanaged<BucketBridge>.fromOpaque(context).takeUnretainedValue()
+}
+
+private func resetHostError(_ error: UnsafeMutablePointer<PotluckDbRuntimeHostErrorV1>?) {
+    guard let error else { return }
+    error.pointee.struct_size = UInt32(MemoryLayout<PotluckDbRuntimeHostErrorV1>.size)
+    error.pointee.abi_version = Seam.abiVersion
+    error.pointee.sqlite_primary_code = 0
+    error.pointee.sqlite_extended_code = 0
+    error.pointee.message = PotluckDbRuntimeSliceV1()
+}
+
+private func bucketFail(
+    _ bridge: BucketBridge,
+    _ code: Int32,
+    _ message: String,
+    _ error: UnsafeMutablePointer<PotluckDbRuntimeHostErrorV1>?
+) -> Int32 {
+    let held = bridge.retain(message)
+    if let error {
+        error.pointee.struct_size = UInt32(MemoryLayout<PotluckDbRuntimeHostErrorV1>.size)
+        error.pointee.abi_version = Seam.abiVersion
+        error.pointee.sqlite_primary_code = 0
+        error.pointee.sqlite_extended_code = 0
+        var slice = PotluckDbRuntimeSliceV1()
+        slice.data = UnsafePointer(held.pointer.assumingMemoryBound(to: UInt8.self))
+        slice.length = UInt64(held.length)
+        error.pointee.message = slice
+    }
+    return code
+}
+
+private func bucketFail(
+    _ bridge: BucketBridge,
+    _ failure: Error,
+    _ error: UnsafeMutablePointer<PotluckDbRuntimeHostErrorV1>?
+) -> Int32 {
+    if let typed = failure as? PotluckDBError {
+        let code = Seam.codes[typed.code] ?? Seam.internalFailure
+        return bucketFail(bridge, code, typed.message, error)
+    }
+    return bucketFail(bridge, Seam.internalFailure, "\(failure)", error)
+}
+
+private func bucketBytes(_ slice: PotluckDbRuntimeSliceV1) -> [UInt8] {
+    guard slice.length > 0, let data = slice.data else { return [] }
+    return Array(UnsafeBufferPointer(start: data, count: Int(slice.length)))
+}
+
+private func bucketText(_ slice: PotluckDbRuntimeSliceV1) -> String {
+    String(decoding: bucketBytes(slice), as: UTF8.self)
+}
+
+private func bucketEmit(
+    _ emit: PotluckDbRuntimeEmitBytesV1?,
+    _ context: UnsafeMutableRawPointer?,
+    _ value: [UInt8]
+) -> Int32 {
+    guard let emit else { return Seam.contractViolation }
+    var slice = PotluckDbRuntimeSliceV1()
+    guard !value.isEmpty else { return emit(context, slice) }
+    return value.withUnsafeBufferPointer { buffer in
+        slice.data = buffer.baseAddress
+        slice.length = UInt64(buffer.count)
+        return emit(context, slice)
+    }
+}
+
+private func bucketGet(
+    _ context: UnsafeMutableRawPointer?,
+    _ key: PotluckDbRuntimeSliceV1,
+    _ emit: PotluckDbRuntimeEmitBytesV1?,
+    _ emitContext: UnsafeMutableRawPointer?,
+    _ error: UnsafeMutablePointer<PotluckDbRuntimeHostErrorV1>?
+) -> Int32 {
+    resetHostError(error)
+    guard let bridge = bucketBridge(context) else { return Seam.contractViolation }
+    do {
+        return bucketEmit(emit, emitContext, try bridge.storage.get(bucketText(key)))
+    } catch let failure {
+        return bucketFail(bridge, failure, error)
+    }
+}
+
+private func bucketPut(
+    _ context: UnsafeMutableRawPointer?,
+    _ key: PotluckDbRuntimeSliceV1,
+    _ data: PotluckDbRuntimeSliceV1,
+    _ error: UnsafeMutablePointer<PotluckDbRuntimeHostErrorV1>?
+) -> Int32 {
+    resetHostError(error)
+    guard let bridge = bucketBridge(context) else { return Seam.contractViolation }
+    do {
+        try bridge.storage.put(bucketText(key), data: bucketBytes(data))
+        return Seam.ok
+    } catch let failure {
+        return bucketFail(bridge, failure, error)
+    }
+}
+
+private func bucketExists(
+    _ context: UnsafeMutableRawPointer?,
+    _ key: PotluckDbRuntimeSliceV1,
+    _ outExists: UnsafeMutablePointer<UInt32>?,
+    _ error: UnsafeMutablePointer<PotluckDbRuntimeHostErrorV1>?
+) -> Int32 {
+    resetHostError(error)
+    guard let bridge = bucketBridge(context) else { return Seam.contractViolation }
+    guard let outExists else {
+        return bucketFail(
+            bridge, Seam.contractViolation, "bucket exists output is null", error
+        )
+    }
+    do {
+        outExists.pointee = try bridge.storage.exists(bucketText(key)) ? 1 : 0
+        return Seam.ok
+    } catch let failure {
+        return bucketFail(bridge, failure, error)
+    }
+}
+
+private func bucketList(
+    _ context: UnsafeMutableRawPointer?,
+    _ prefix: PotluckDbRuntimeSliceV1,
+    _ emit: PotluckDbRuntimeEmitBytesV1?,
+    _ emitContext: UnsafeMutableRawPointer?,
+    _ error: UnsafeMutablePointer<PotluckDbRuntimeHostErrorV1>?
+) -> Int32 {
+    resetHostError(error)
+    guard let bridge = bucketBridge(context) else { return Seam.contractViolation }
+    do {
+        for key in try bridge.storage.list(bucketText(prefix)) {
+            let code = bucketEmit(emit, emitContext, Array(key.utf8))
+            if code != Seam.ok { return code }
+        }
+        return Seam.ok
+    } catch let failure {
+        return bucketFail(bridge, failure, error)
+    }
+}
+
+private func bucketDelete(
+    _ context: UnsafeMutableRawPointer?,
+    _ key: PotluckDbRuntimeSliceV1,
+    _ error: UnsafeMutablePointer<PotluckDbRuntimeHostErrorV1>?
+) -> Int32 {
+    resetHostError(error)
+    guard let bridge = bucketBridge(context) else { return Seam.contractViolation }
+    do {
+        try bridge.storage.delete(bucketText(key))
+        return Seam.ok
+    } catch let failure {
+        return bucketFail(bridge, failure, error)
+    }
+}
+
+private func bucketCell(
+    _ context: UnsafeMutableRawPointer?,
+    _ head: Bool,
+    _ emit: PotluckDbRuntimeEmitBytesV1?,
+    _ emitContext: UnsafeMutableRawPointer?,
+    _ error: UnsafeMutablePointer<PotluckDbRuntimeHostErrorV1>?
+) -> Int32 {
+    resetHostError(error)
+    guard let bridge = bucketBridge(context) else { return Seam.contractViolation }
+    do {
+        let value = head
+            ? try bridge.storage.headGet()
+            : try bridge.storage.floorGet()
+        return bucketEmit(emit, emitContext, value)
+    } catch let failure {
+        return bucketFail(bridge, failure, error)
+    }
+}
+
+private func bucketHeadGet(
+    _ context: UnsafeMutableRawPointer?,
+    _ emit: PotluckDbRuntimeEmitBytesV1?,
+    _ emitContext: UnsafeMutableRawPointer?,
+    _ error: UnsafeMutablePointer<PotluckDbRuntimeHostErrorV1>?
+) -> Int32 {
+    bucketCell(context, true, emit, emitContext, error)
+}
+
+private func bucketFloorGet(
+    _ context: UnsafeMutableRawPointer?,
+    _ emit: PotluckDbRuntimeEmitBytesV1?,
+    _ emitContext: UnsafeMutableRawPointer?,
+    _ error: UnsafeMutablePointer<PotluckDbRuntimeHostErrorV1>?
+) -> Int32 {
+    bucketCell(context, false, emit, emitContext, error)
+}
+
+private func bucketSwap(
+    _ context: UnsafeMutableRawPointer?,
+    _ head: Bool,
+    _ expectedPresent: UInt32,
+    _ expected: PotluckDbRuntimeSliceV1,
+    _ replacement: PotluckDbRuntimeSliceV1,
+    _ outSwapped: UnsafeMutablePointer<UInt32>?,
+    _ error: UnsafeMutablePointer<PotluckDbRuntimeHostErrorV1>?
+) -> Int32 {
+    resetHostError(error)
+    guard let bridge = bucketBridge(context) else { return Seam.contractViolation }
+    guard let outSwapped else {
+        return bucketFail(
+            bridge, Seam.contractViolation, "bucket cell-swap output is null", error
+        )
+    }
+    guard expectedPresent <= 1 else {
+        return bucketFail(
+            bridge,
+            Seam.contractViolation,
+            "bucket expected-present flag is not Boolean",
+            error
+        )
+    }
+    guard expectedPresent != 0 || expected.length == 0 else {
+        return bucketFail(
+            bridge,
+            Seam.contractViolation,
+            "bucket absent expected cell contains bytes",
+            error
+        )
+    }
+    do {
+        // A nil expected compares against absence; an empty array compares
+        // against the empty value, and B2 tells the two apart.
+        let previous: [UInt8]? = expectedPresent == 0 ? nil : bucketBytes(expected)
+        let value = bucketBytes(replacement)
+        let swapped = head
+            ? try bridge.storage.headSwap(expected: previous, value: value)
+            : try bridge.storage.floorSwap(expected: previous, value: value)
+        outSwapped.pointee = swapped ? 1 : 0
+        return Seam.ok
+    } catch let failure {
+        return bucketFail(bridge, failure, error)
+    }
+}
+
+private func bucketHeadSwap(
+    _ context: UnsafeMutableRawPointer?,
+    _ expectedPresent: UInt32,
+    _ expected: PotluckDbRuntimeSliceV1,
+    _ replacement: PotluckDbRuntimeSliceV1,
+    _ outSwapped: UnsafeMutablePointer<UInt32>?,
+    _ error: UnsafeMutablePointer<PotluckDbRuntimeHostErrorV1>?
+) -> Int32 {
+    bucketSwap(context, true, expectedPresent, expected, replacement, outSwapped, error)
+}
+
+private func bucketFloorSwap(
+    _ context: UnsafeMutableRawPointer?,
+    _ expectedPresent: UInt32,
+    _ expected: PotluckDbRuntimeSliceV1,
+    _ replacement: PotluckDbRuntimeSliceV1,
+    _ outSwapped: UnsafeMutablePointer<UInt32>?,
+    _ error: UnsafeMutablePointer<PotluckDbRuntimeHostErrorV1>?
+) -> Int32 {
+    bucketSwap(context, false, expectedPresent, expected, replacement, outSwapped, error)
+}
+
+private func bucketCellPairGet(
+    _ context: UnsafeMutableRawPointer?,
+    _ emitHead: PotluckDbRuntimeEmitBytesV1?,
+    _ headContext: UnsafeMutableRawPointer?,
+    _ emitFloor: PotluckDbRuntimeEmitBytesV1?,
+    _ floorContext: UnsafeMutableRawPointer?,
+    _ error: UnsafeMutablePointer<PotluckDbRuntimeHostErrorV1>?
+) -> Int32 {
+    resetHostError(error)
+    guard let bridge = bucketBridge(context) else { return Seam.contractViolation }
+    guard let pair = bridge.pair else {
+        return bucketFail(
+            bridge,
+            Seam.contractViolation,
+            "bucket declared no cell-pair capability",
+            error
+        )
+    }
+    do {
+        let observed = try pair.cellPairGet()
+        // An absent cell is no emission at all, which is how the seam says
+        // None; an empty array is a present cell holding no bytes.
+        if let head = observed.head {
+            let code = bucketEmit(emitHead, headContext, head)
+            if code != Seam.ok { return code }
+        }
+        if let floor = observed.floor {
+            let code = bucketEmit(emitFloor, floorContext, floor)
+            if code != Seam.ok { return code }
+        }
+        return Seam.ok
+    } catch let failure {
+        return bucketFail(bridge, failure, error)
+    }
+}
+
+private func bucketCounters(
+    _ context: UnsafeMutableRawPointer?,
+    _ outCounters: UnsafeMutablePointer<PotluckDbRuntimeBucketCounterSnapshotV1>?
+) {
+    guard let outCounters, let bridge = bucketBridge(context) else { return }
+    let value = bridge.storage.counters()
+    outCounters.pointee.struct_size = UInt32(
+        MemoryLayout<PotluckDbRuntimeBucketCounterSnapshotV1>.size
+    )
+    outCounters.pointee.abi_version = Seam.abiVersion
+    outCounters.pointee.gets = value.gets
+    outCounters.pointee.puts = value.puts
+    outCounters.pointee.idempotent_puts = value.idempotentPuts
+    outCounters.pointee.exists = value.exists
+    outCounters.pointee.lists = value.lists
+    outCounters.pointee.deletes = value.deletes
+    outCounters.pointee.cell_gets = value.cellGets
+    outCounters.pointee.cell_swaps = value.cellSwaps
+    outCounters.pointee.cell_swap_wins = value.cellSwapWins
+    outCounters.pointee.transport_gets = value.transportGets
+    outCounters.pointee.transport_puts = value.transportPuts
+    outCounters.pointee.transport_heads = value.transportHeads
+    outCounters.pointee.transport_lists = value.transportLists
+    outCounters.pointee.transport_deletes = value.transportDeletes
+    outCounters.pointee.transport_bytes_received = value.transportBytesReceived
+    outCounters.pointee.transport_bytes_submitted = value.transportBytesSubmitted
+}
+
+extension Remote {
+    /// A Remote over a Swift bucket, with no native table for the caller to
+    /// build.
+    ///
+    /// The same canonical `Remote.from_storage` intent as the overload on
+    /// the type, taking this language's own Seam-4 protocol rather than a
+    /// pointer to a table nothing in this SDK fills in. The adapter table
+    /// is released with the Remote's handle, after its exchange is gone.
+    public static func fromStorage(
+        _ storage: BucketStorage,
+        options: RemoteOptions = .defaults
+    ) throws -> Remote {
+        let owner = BucketAdapterOwner(storage: storage)
+        try options.validate()
+        var rawOptions = rawRemoteOptions(options)
+        var handle: PotluckDbRemoteHandleV1 = 0
+        try applicationCall { error in
+            potluckdb_remote_from_storage_v1(owner.table, &rawOptions, &handle, error)
+        }
+        return try Remote(
+            state: HandleState(
+                handle: handle,
+                close: potluckdb_remote_close_v1,
+                release: potluckdb_remote_release_v1,
+                retained: owner
+            )
+        )
+    }
+}
+
+// MARK: - Shared storage library
+
+/// Which S3-compatible bucket, and how to reach it.
+///
+/// Built as a type rather than a pile of arguments so adding a field
+/// later is not a change to every call site -- the shape this crosses
+/// the ABI as is JSON for the same reason.
+public struct S3Options: Sendable {
+    public var bucket: String
+    public var namespace: String
+    public var region: String?
+    public var endpoint: String?
+    public var forcePathStyle: Bool
+    public var accessKeyId: String?
+    public var secretAccessKey: String?
+    public var sessionToken: String?
+    public var remote: RemoteOptions
+
+    public init(
+        bucket: String,
+        namespace: String,
+        region: String? = nil,
+        endpoint: String? = nil,
+        forcePathStyle: Bool = false,
+        accessKeyId: String? = nil,
+        secretAccessKey: String? = nil,
+        sessionToken: String? = nil,
+        remote: RemoteOptions = .defaults
+    ) {
+        self.bucket = bucket
+        self.namespace = namespace
+        self.region = Self.absent(region)
+        self.endpoint = Self.absent(endpoint)
+        self.forcePathStyle = forcePathStyle
+        self.accessKeyId = Self.absent(accessKeyId)
+        self.secretAccessKey = Self.absent(secretAccessKey)
+        self.sessionToken = Self.absent(sessionToken)
+        self.remote = remote
+    }
+
+    /// Null and empty are the same absence, as they are in the Go facade.
+    static func absent(_ value: String?) -> String? {
+        guard let value, !value.isEmpty else { return nil }
+        return value
+    }
+}
+
+/// Which Google Cloud Storage bucket, and how to reach it.
+///
+/// Built as a type rather than a pile of arguments so adding a field
+/// later is not a change to every call site -- the shape this crosses
+/// the ABI as is JSON for the same reason.
+public struct GcsOptions: Sendable {
+    public var bucket: String
+    public var namespace: String
+    public var endpoint: String?
+    /// The JSON key Google issues, as the text of it. `nil` uses
+    /// Application Default Credentials.
+    public var serviceAccount: String?
+    public var remote: RemoteOptions
+
+    public init(
+        bucket: String,
+        namespace: String,
+        endpoint: String? = nil,
+        serviceAccount: String? = nil,
+        remote: RemoteOptions = .defaults
+    ) {
+        self.bucket = bucket
+        self.namespace = namespace
+        self.endpoint = S3Options.absent(endpoint)
+        self.serviceAccount = S3Options.absent(serviceAccount)
+        self.remote = remote
+    }
+}
+
+/// Which Azure Blob Storage container, and how to reach it.
+///
+/// Built as a type rather than a pile of arguments so adding a field
+/// later is not a change to every call site -- the shape this crosses
+/// the ABI as is JSON for the same reason.
+public struct AzureOptions: Sendable {
+    public var account: String
+    public var container: String
+    public var namespace: String
+    /// The endpoint, for a store that is not Azure's own. Reaches the
+    /// native library as `endpoint_url`; Azurite is one account under one
+    /// port, so its endpoint carries the account as a path segment.
+    public var endpoint: String?
+    /// An explicit account key. `nil` uses the Azure credential chain.
+    public var accountKey: String?
+    public var remote: RemoteOptions
+
+    public init(
+        account: String,
+        container: String,
+        namespace: String,
+        endpoint: String? = nil,
+        accountKey: String? = nil,
+        remote: RemoteOptions = .defaults
+    ) {
+        self.account = account
+        self.container = container
+        self.namespace = namespace
+        self.endpoint = S3Options.absent(endpoint)
+        self.accountKey = S3Options.absent(accountKey)
+        self.remote = remote
+    }
+}
+
+private typealias StorageAbiVersionFn = @convention(c) () -> UInt32
+private typealias StorageErrorSizeFn = @convention(c) () -> UInt32
+private typealias StorageErrorReleaseFn = @convention(c) (
+    UnsafeMutablePointer<PotluckDbStorageErrorV1>
+) -> Int32
+private typealias StorageCreateFn = @convention(c) (
+    PotluckDbStorageSliceV1,
+    UnsafeMutablePointer<UnsafePointer<PotluckDbRuntimeBucketAdapterV1>?>,
+    UnsafeMutablePointer<PotluckDbStorageErrorV1>
+) -> Int32
+private typealias StorageReleaseFn = @convention(c) (
+    UnsafePointer<PotluckDbRuntimeBucketAdapterV1>?
+) -> Int32
+
+/// Process-wide load of libpotluckdb_storage. Never unloaded: every
+/// table it handed out points into its code.
+private final class StorageLibraryState: @unchecked Sendable {
+    let lock = NSLock()
+    var loaded = false
+    var loadError: PotluckDBError?
+    var handle: UnsafeMutableRawPointer?
+    var creates: [String: StorageCreateFn] = [:]
+    var release: StorageReleaseFn?
+    var errorRelease: StorageErrorReleaseFn?
+}
+
+private let storageLibrary = StorageLibraryState()
+private let storageAbiVersion: UInt32 = 1
+private let storageOk: Int32 = 0
+
+/// Which function in the library builds which provider's adapter.
+///
+/// Closed on purpose, and consulted before a library is looked for: it
+/// is this SDK's own knowledge of what the library it was built against
+/// exports, so a provider that is not in it is answered from here rather
+/// than by asking `dlsym` for a name nobody chose.
+///
+/// Internal rather than private: the conformance program compiles into
+/// this module and holds it against the names the library exports.
+let storageProviderEntryPoints: [String: String] = [
+    "s3": "potluckdb_storage_s3_create_v1",
+    "gcs": "potluckdb_storage_gcs_create_v1",
+    "azure": "potluckdb_storage_azure_create_v1",
+]
+
+/// A provider this SDK has no entry point for.
+///
+/// Answered before the library is looked for: a caller who mistyped a
+/// provider should read that back rather than a complaint about an
+/// absent install.
+func storageUnknownProvider(_ provider: String) -> PotluckDBError {
+    PotluckDBError(
+        code: "storage_library_unavailable",
+        category: .permanent,
+        message: "provider \"\(provider)\" is not one this SDK can load. "
+            + "The storage library provides \"s3\", \"gcs\", and \"azure\".",
+        action: "Correct the provider name and retry."
+    )
+}
+
+/// A provider this SDK knows, absent from the library it loaded.
+///
+/// The ordinary cause is an older storage library on the machine than
+/// the one this SDK was built against -- the provider was added after it
+/// was built -- so the remedy is the library, not the call.
+func storageMissingEntryPoint(_ provider: String, symbol: String) -> PotluckDBError {
+    PotluckDBError(
+        code: "storage_library_unavailable",
+        category: .permanent,
+        message: "the storage library does not export \"\(symbol)\". "
+            + "It may predate provider \"\(provider)\"; "
+            + "update the potluckdb storage library.",
+        action: "Ship a libpotluckdb_storage matching this SDK's version."
+    )
+}
+
+private func storageLoad() throws {
+    storageLibrary.lock.lock()
+    defer { storageLibrary.lock.unlock() }
+    if storageLibrary.loaded { return }
+    if let loadError = storageLibrary.loadError { throw loadError }
+    do {
+        try storageOpen()
+        storageLibrary.loaded = true
+    } catch let error as PotluckDBError {
+        storageLibrary.loadError = error
+        throw error
+    }
+}
+
+private func storageDefaultName() -> String {
+    #if os(Windows)
+    return "potluckdb_storage.dll"
+    #elseif os(macOS) || os(iOS) || os(tvOS) || os(watchOS)
+    return "libpotluckdb_storage.dylib"
+    #else
+    return "libpotluckdb_storage.so"
+    #endif
+}
+
+/// Where the storage library is for this process.
+///
+/// `POTLUCKDB_STORAGE_LIBRARY` first, because someone who named a library
+/// meant that one. Then beside the running executable, where a program's
+/// libraries sit, and in the `Frameworks` directory of the bundle the
+/// executable is in, where an application's ship. Otherwise the
+/// platform's own name, which lets the loader search wherever it
+/// searches. A package build links the storage binary target and copies
+/// its library beside the product, which is the first of those places.
+private func storageLibraryPath() -> String {
+    let configured = ProcessInfo.processInfo.environment["POTLUCKDB_STORAGE_LIBRARY"]
+    if let configured, !configured.isEmpty {
+        return configured
+    }
+    let name = storageDefaultName()
+    var candidates: [String] = []
+    if let executable = Bundle.main.executableURL {
+        candidates.append(
+            executable.deletingLastPathComponent().appendingPathComponent(name).path
+        )
+    }
+    if let frameworks = Bundle.main.privateFrameworksURL {
+        candidates.append(frameworks.appendingPathComponent(
+            "PotluckDBStorage.framework/PotluckDBStorage"
+        ).path)
+        candidates.append(frameworks.appendingPathComponent(name).path)
+    }
+    for candidate in candidates where FileManager.default.fileExists(atPath: candidate) {
+        return candidate
+    }
+    return name
+}
+
+private func storageOpen() throws {
+    let path = storageLibraryPath()
+    _ = dlerror()
+    guard let handle = dlopen(path, RTLD_NOW) else {
+        let reason = dlerror().map { String(cString: $0) } ?? "no reason was reported"
+        throw PotluckDBError.storageUnavailable(reason)
+    }
+    func symbol<T>(_ name: String) throws -> T {
+        _ = dlerror()
+        guard let pointer = dlsym(handle, name) else {
+            throw PotluckDBError.storageUnavailable(
+                "the storage library does not export the v1 entry points"
+            )
+        }
+        return unsafeBitCast(pointer, to: T.self)
+    }
+    // Only the four every provider shares. The per-provider create is
+    // resolved by storageEntryPoint when a provider is asked for, so a
+    // library built before one provider existed stays usable for the
+    // others.
+    let abiVersion: StorageAbiVersionFn = try symbol("potluckdb_storage_abi_version_v1")
+    let errorSize: StorageErrorSizeFn = try symbol("potluckdb_storage_error_size_v1")
+    storageLibrary.errorRelease = try symbol("potluckdb_storage_error_release_v1")
+    storageLibrary.release = try symbol("potluckdb_storage_release_v1")
+    storageLibrary.handle = handle
+    if abiVersion() != storageAbiVersion {
+        throw PotluckDBError.storageUnavailable(
+            "the storage library speaks a different ABI"
+        )
+    }
+    if errorSize() != UInt32(MemoryLayout<PotluckDbStorageErrorV1>.size) {
+        throw PotluckDBError.storageUnavailable(
+            "the storage library declares a different error structure"
+        )
+    }
+}
+
+/// One provider's create function, resolved the first time that
+/// provider is asked for.
+private func storageEntryPoint(
+    _ provider: String, symbol: String
+) throws -> StorageCreateFn {
+    storageLibrary.lock.lock()
+    defer { storageLibrary.lock.unlock() }
+    if let known = storageLibrary.creates[symbol] { return known }
+    guard let handle = storageLibrary.handle else {
+        throw PotluckDBError.storageUnavailable(
+            "the storage library does not export the v1 entry points"
+        )
+    }
+    _ = dlerror()
+    guard let address = dlsym(handle, symbol) else {
+        throw storageMissingEntryPoint(provider, symbol: symbol)
+    }
+    let resolved = unsafeBitCast(address, to: StorageCreateFn.self)
+    storageLibrary.creates[symbol] = resolved
+    return resolved
+}
+
+private func storageCreate(_ provider: String, document: String) throws
+    -> UnsafePointer<PotluckDbRuntimeBucketAdapterV1>
+{
+    guard let symbol = storageProviderEntryPoints[provider] else {
+        throw storageUnknownProvider(provider)
+    }
+    try storageLoad()
+    let create = try storageEntryPoint(provider, symbol: symbol)
+    guard let errorRelease = storageLibrary.errorRelease else {
+        throw PotluckDBError.storageUnavailable(
+            "the storage library does not export the v1 entry points"
+        )
+    }
+    let encoded = Array(document.utf8)
+    return try encoded.withUnsafeBufferPointer { buffer in
+        let slice = PotluckDbStorageSliceV1(
+            data: buffer.baseAddress,
+            length: UInt64(buffer.count)
+        )
+        var adapter: UnsafePointer<PotluckDbRuntimeBucketAdapterV1>?
+        var reported = PotluckDbStorageErrorV1()
+        reported.struct_size = UInt32(MemoryLayout<PotluckDbStorageErrorV1>.size)
+        reported.abi_version = storageAbiVersion
+        let code = create(slice, &adapter, &reported)
+        if code == storageOk {
+            guard let adapter else {
+                throw PotluckDBError.storageUnavailable(
+                    "the storage library refused the configuration"
+                )
+            }
+            return adapter
+        }
+        var message = "the storage library refused the configuration"
+        if let data = reported.message.data, reported.message.length > 0 {
+            message = String(
+                decoding: UnsafeBufferPointer(
+                    start: data, count: Int(reported.message.length)
+                ),
+                as: UTF8.self
+            )
+        }
+        _ = errorRelease(&reported)
+        if code == 24 {
+            throw PotluckDBError(code: "bucket_not_found", category: .permanent,
+                message: message, action: "Create the bucket or container, or correct the name the remote was configured with.")
+        }
+        throw PotluckDBError.invalidArgument(
+            message,
+            action: "Correct the storage configuration and retry."
+        )
+    }
+}
+
+private func storageRelease(
+    _ adapter: UnsafePointer<PotluckDbRuntimeBucketAdapterV1>
+) {
+    _ = storageLibrary.release?(adapter)
+}
+
+/// Remotes over object storage, from the shared native storage library.
+///
+/// `Remote.fromStorage` takes a bucket a caller implements. This takes
+/// one nobody implements: the Seam-4 semantics, the HTTP and the AWS
+/// credential chain all live in `potluckdb-storage`, one native library
+/// that every SDK loads. A separate type rather than a `Remote`
+/// constructor because Remote's member set is fixed by
+/// `contracts/sdk-surface-v1.json`.
+public enum Storage {
+    /// A remote over an S3-compatible bucket, through the shared library.
+    ///
+    /// Credentials come from the AWS chain -- environment, shared
+    /// configuration and credentials files, SSO, web identity, container
+    /// and instance metadata -- unless `accessKeyId` and `secretAccessKey`
+    /// name a pair. Pass keys for a store that is not AWS: Cloudflare R2
+    /// issues a pair with an account `endpoint` and wants `region` "auto".
+    /// MinIO and most self-hosted gateways want `forcePathStyle`, which
+    /// addresses the bucket as a path segment rather than as a subdomain.
+    public static func fromS3(_ options: S3Options) throws -> Remote {
+        if options.bucket.isEmpty || options.namespace.isEmpty {
+            throw PotluckDBError.invalidArgument(
+                "an S3 remote needs a bucket and a namespace",
+                action: "Name both: one bucket holds many databases, one per namespace."
+            )
+        }
+        if (options.accessKeyId == nil) != (options.secretAccessKey == nil) {
+            // Half a credential is not a credential and is not an absent
+            // one either: taken as absent, the chain would answer with
+            // somebody else's keys and the failure would name a permission.
+            throw PotluckDBError.invalidArgument(
+                "accessKeyId and secretAccessKey are given together or not at all",
+                action: "Pass both to use explicit credentials, or neither for the AWS chain."
+            )
+        }
+        return try fromProvider("s3", document: document(options), options: options.remote)
+    }
+
+    /// A remote over a Google Cloud Storage bucket, through the shared
+    /// library.
+    ///
+    /// Credentials come from Application Default Credentials --
+    /// `GOOGLE_APPLICATION_CREDENTIALS`, the gcloud user credentials
+    /// file, then the metadata server -- unless `serviceAccount` names a
+    /// key. Pass the JSON key Google issues for a process that has no
+    /// such chain to consult.
+    public static func fromGcs(_ options: GcsOptions) throws -> Remote {
+        if options.bucket.isEmpty || options.namespace.isEmpty {
+            throw PotluckDBError.invalidArgument(
+                "a GCS remote needs a bucket and a namespace",
+                action: "Name both: one bucket holds many databases, one per namespace."
+            )
+        }
+        return try fromProvider(
+            "gcs", document: document(options), options: options.remote
+        )
+    }
+
+    /// A remote over an Azure Blob Storage container, through the shared
+    /// library.
+    ///
+    /// Credentials come from the Azure chain -- environment, workload
+    /// identity, managed identity, the Azure CLI and the developer tools
+    /// -- unless `accountKey` names a key. Azurite issues the well-known
+    /// `devstoreaccount1` pair and wants an `endpoint` that carries the
+    /// account.
+    public static func fromAzure(_ options: AzureOptions) throws -> Remote {
+        if options.account.isEmpty || options.container.isEmpty
+            || options.namespace.isEmpty
+        {
+            throw PotluckDBError.invalidArgument(
+                "an Azure remote needs an account, a container and a namespace",
+                action: "Name all three: one container holds many databases, "
+                    + "one per namespace."
+            )
+        }
+        return try fromProvider(
+            "azure", document: document(options), options: options.remote
+        )
+    }
+
+    /// A remote over whichever provider's adapter the library builds.
+    ///
+    /// The one place this facade crosses into the loader. Everything
+    /// that is not the provider -- the entry point lookup, the adapter's
+    /// ownership, the remote options -- is the same for all three, so it
+    /// is written once here and each facade supplies only its own
+    /// document.
+    ///
+    /// Internal rather than public: naming a provider and hand-building
+    /// its document is not the surface callers get, `fromS3`, `fromGcs`
+    /// and `fromAzure` are.
+    static func fromProvider(
+        _ provider: String, document: String, options: RemoteOptions
+    ) throws -> Remote {
+        let adapter = try storageCreate(provider, document: document)
+        let storage = Integrator.StorageAdapter.borrowed(adapter.pointee)
+        let remote: Remote
+        do {
+            remote = try Remote.fromStorage(storage, options: options)
+        } catch {
+            storageRelease(adapter)
+            throw error
+        }
+        let held = adapter
+        remote.state.afterClose = { storageRelease(held) }
+        return remote
+    }
+
+    /// One JSON string, escaped.
+    ///
+    /// Hand-written because this SDK carries no JSON encoder for this
+    /// document and the document it builds is four fields deep.
+    public static func quoted(_ value: String) -> String {
+        var output = "\""
+        for character in value {
+            switch character {
+            case "\"": output += "\\\""
+            case "\\": output += "\\\\"
+            case "\n": output += "\\n"
+            case "\r": output += "\\r"
+            case "\t": output += "\\t"
+            default:
+                let scalar = character.unicodeScalars.first!
+                if scalar.value < 0x20 {
+                    output += String(format: "\\u%04x", scalar.value)
+                } else {
+                    output.append(character)
+                }
+            }
+        }
+        output += "\""
+        return output
+    }
+
+    public static func document(_ options: S3Options) -> String {
+        var body = "{\"provider\":\"s3\",\"bucket\":"
+        body += quoted(options.bucket)
+        body += ",\"namespace\":"
+        body += quoted(options.namespace)
+        body += ",\"force_path_style\":"
+        body += options.forcePathStyle ? "true" : "false"
+        if let region = options.region {
+            body += ",\"region\":"
+            body += quoted(region)
+        }
+        if let endpoint = options.endpoint {
+            body += ",\"endpoint\":"
+            body += quoted(endpoint)
+        }
+        body += ",\"credentials\":"
+        if let key = options.accessKeyId, let secret = options.secretAccessKey {
+            body += "{\"mode\":\"explicit\",\"access_key_id\":"
+            body += quoted(key)
+            body += ",\"secret_access_key\":"
+            body += quoted(secret)
+            if let token = options.sessionToken {
+                body += ",\"session_token\":"
+                body += quoted(token)
+            }
+            body += "}"
+        } else {
+            body += "{\"mode\":\"ambient\"}"
+        }
+        body += "}"
+        return body
+    }
+
+    public static func document(_ options: GcsOptions) -> String {
+        var body = "{\"provider\":\"gcs\",\"bucket\":"
+        body += quoted(options.bucket)
+        body += ",\"namespace\":"
+        body += quoted(options.namespace)
+        if let endpoint = options.endpoint {
+            body += ",\"endpoint\":"
+            body += quoted(endpoint)
+        }
+        body += ",\"credentials\":"
+        if let serviceAccount = options.serviceAccount {
+            // The key crosses as the text it already is. Parsing it here
+            // to re-emit it would be this facade inventing a shape, and
+            // the library reads either form.
+            body += "{\"mode\":\"explicit\",\"service_account\":"
+            body += quoted(serviceAccount)
+            body += "}"
+        } else {
+            body += "{\"mode\":\"ambient\"}"
+        }
+        body += "}"
+        return body
+    }
+
+    public static func document(_ options: AzureOptions) -> String {
+        var body = "{\"provider\":\"azure\",\"account\":"
+        body += quoted(options.account)
+        body += ",\"container\":"
+        body += quoted(options.container)
+        body += ",\"namespace\":"
+        body += quoted(options.namespace)
+        if let endpoint = options.endpoint {
+            // endpoint_url, not endpoint: the rename happens here so that
+            // one spelling reaches callers across all three providers.
+            body += ",\"endpoint_url\":"
+            body += quoted(endpoint)
+        }
+        body += ",\"credentials\":"
+        if let accountKey = options.accountKey {
+            body += "{\"mode\":\"explicit\",\"account_key\":"
+            body += quoted(accountKey)
+            body += "}"
+        } else {
+            body += "{\"mode\":\"ambient\"}"
+        }
+        body += "}"
+        return body
     }
 }

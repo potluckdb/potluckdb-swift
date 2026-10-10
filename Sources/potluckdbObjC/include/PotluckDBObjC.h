@@ -6,10 +6,11 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
+@class PLKSyncResult;
+
 FOUNDATION_EXPORT NSErrorDomain const PLKErrorDomain;
 FOUNDATION_EXPORT NSErrorUserInfoKey const PLKErrorCodeKey;
 FOUNDATION_EXPORT NSErrorUserInfoKey const PLKErrorActionKey;
-FOUNDATION_EXPORT NSErrorUserInfoKey const PLKErrorRetryAfterMillisecondsKey;
 
 typedef NS_ENUM(NSInteger, PLKErrorCategory) {
     PLKErrorCategoryCaller = 1,
@@ -22,6 +23,16 @@ typedef NS_ENUM(NSInteger, PLKTransactionMode) {
     PLKTransactionModeDeferred = 1,
     PLKTransactionModeImmediate = 2,
     PLKTransactionModeExclusive = 3,
+};
+
+/// Which engine answers a read.
+///
+/// `contracts/sdk-surface-v1.json` fixes this language's spelling, down
+/// to the capitals in `PLKQueryEngineDuckDB`, so ten SDKs agree on how a
+/// caller writes it.
+typedef NS_ENUM(NSInteger, PLKQueryEngine) {
+    PLKQueryEngineSqlite = 1,
+    PLKQueryEngineDuckDB = 2,
 };
 
 /// Identifies one published database state.
@@ -86,13 +97,16 @@ typedef NS_ENUM(NSInteger, PLKTransactionMode) {
 
 @end
 
-/// Bounds retained revisions during collection.
+/// Selects bounded or unbounded revision retention.
 @interface PLKRetentionPolicy : NSObject
 
 + (nullable instancetype)boundedWithKeepLast:(uint64_t)keepLast
                                    collectAt:(uint64_t)collectAt
                                        error:(NSError **)error;
 + (instancetype)boundedPolicy;
+/// Keeps every revision until collect runs with a bounded policy.
++ (instancetype)unboundedPolicy;
+@property(nonatomic, readonly) BOOL bounded;
 
 @end
 
@@ -100,6 +114,7 @@ typedef NS_ENUM(NSInteger, PLKTransactionMode) {
 @interface PLKConnectionOptions : NSObject
 
 @property(nonatomic) uint64_t timeoutMilliseconds;
+/// Maximum rows per query; defaults to 1000000.
 @property(nonatomic) uint64_t maximumRows;
 @property(nonatomic, strong) PLKPrefetchPolicy *prefetch;
 @property(nonatomic, strong) PLKCheckpointPolicy *checkpoint;
@@ -115,7 +130,20 @@ typedef NS_ENUM(NSInteger, PLKTransactionMode) {
 @property(nonatomic, strong, nullable) NSData *encryptionKey;
 @property(nonatomic, strong) PLKSyncPolicy *syncPolicy;
 @property(nonatomic, copy, nullable) NSString *clientID;
+/// Supplies the license key described in contracts/licensing.md#requirements.
+@property(nonatomic, copy, nullable) NSString *licenseKey;
+@property(nonatomic, copy, nullable) NSString *analyticalEngine;
 @property(nonatomic, strong) PLKConnectionOptions *connection;
+/// Receives the outcome of every automatic synchronization attempt of
+/// a database: a `PLKSyncResult` whose `outcome` is `UpToDate`,
+/// `Pushed`, `Pulled`, `Conflict` or `Failed` with the `error`. The hook
+/// is invoked on the synchronization thread. Do not call the database
+/// from inside it; transfer the outcome to the program's own thread.
+/// `closeWithError:` returns after the last invocation. A snapshot never
+/// synchronizes, so `openRevisionAtPath:revision:remote:options:error:`
+/// ignores it. An exception the block raises is not caught and
+/// terminates the program.
+@property(nonatomic, copy, nullable) void (^onSync)(PLKSyncResult *outcome);
 
 @end
 
@@ -124,12 +152,15 @@ typedef NS_ENUM(NSInteger, PLKTransactionMode) {
 
 @property(nonatomic) uint32_t readConcurrency;
 @property(nonatomic) uint32_t writeConcurrency;
-@property(nonatomic, strong, nullable) PLKRetentionPolicy *retention;
+/// Bounded by default: keep the newest ten revisions, collect once twenty exist.
+/// Setting nil restores the default.
+@property(nonatomic, strong, null_resettable) PLKRetentionPolicy *retention;
 
 @end
 
 /// SQL parameter bindings. Values must be NSNull, NSNumber, NSString, or
-/// NSData.
+/// NSData. An NSNumber binds by its objCType, so an NSDecimalNumber binds as
+/// REAL through doubleValue; bind an integer NSNumber for an exact integer.
 @interface PLKBindings : NSObject
 
 + (instancetype)positional:(NSArray *)values;
@@ -139,6 +170,36 @@ typedef NS_ENUM(NSInteger, PLKTransactionMode) {
 @end
 
 /// Reports one write statement's effect.
+/// One result row, readable by position or by column name. A name that
+/// appears twice answers its last position.
+@interface PLKRow : NSObject <NSFastEnumeration>
+/// The column names in select-list order.
+@property(nonatomic, readonly) NSArray<NSString *> *columns;
+/// The cells in select-list order; SQL NULL is `NSNull`.
+@property(nonatomic, readonly) NSArray *values;
+/// The number of cells.
+@property(nonatomic, readonly) NSUInteger count;
+/// The cell at a select-list position, for `row[0]`.
+- (id)objectAtIndexedSubscript:(NSUInteger)index;
+/// The cell under a column name, for `row[@"body"]`; nil when the select
+/// list has no such column.
+- (nullable id)objectForKeyedSubscript:(NSString *)column;
+@end
+
+/// A query result: the column names of the select list in order, then the
+/// rows.
+@interface PLKRows : NSObject <NSFastEnumeration>
+/// The column names in select-list order; a name that appears twice is
+/// listed twice.
+@property(nonatomic, readonly) NSArray<NSString *> *columns;
+/// The rows in result order.
+@property(nonatomic, readonly) NSArray<PLKRow *> *rows;
+/// The number of rows.
+@property(nonatomic, readonly) NSUInteger count;
+/// The row at a position, for `rows[0]`.
+- (PLKRow *)objectAtIndexedSubscript:(NSUInteger)index;
+@end
+
 @interface PLKExecuteResult : NSObject
 
 @property(nonatomic, readonly) int64_t rowsAffected;
@@ -151,6 +212,10 @@ typedef NS_ENUM(NSInteger, PLKSyncOutcome) {
     PLKSyncOutcomePushed = 2,
     PLKSyncOutcomePulled = 3,
     PLKSyncOutcomeConflict = 4,
+    /// An automatic attempt that failed, carrying the error
+    /// `syncWithError:` would have reported. Only `PLKOpenOptions.onSync`
+    /// delivers it: `syncWithError:` reports the error itself.
+    PLKSyncOutcomeFailed = 5,
 };
 
 /// One synchronization cycle's outcome.
@@ -161,6 +226,8 @@ typedef NS_ENUM(NSInteger, PLKSyncOutcome) {
 @property(nonatomic, readonly, nullable) NSArray<NSString *> *replayed;
 @property(nonatomic, readonly, nullable) NSArray<NSString *> *quarantined;
 @property(nonatomic, readonly, nullable) NSString *conflictReason;
+/// The error of a `PLKSyncOutcomeFailed` outcome; nil for every other.
+@property(nonatomic, readonly, nullable) NSError *error;
 
 @end
 
@@ -298,12 +365,19 @@ typedef NS_ENUM(NSInteger, PLKSyncOutcome) {
 + (nullable instancetype)remoteFromDirectory:(NSString *)path
                                      options:(nullable PLKRemoteOptions *)options
                                        error:(NSError **)error;
+/// A Remote over a caller-built native bucket adapter table.
+///
+/// Objective-C takes only this native adapter pointer here: it declares
+/// no `BucketStorage` interface yet, so unlike its siblings it cannot
+/// build the table over an application-written bucket. The interface
+/// A22 describes is owed, and this exemption lapses when it is declared.
 + (nullable instancetype)remoteFromStorage:(PLKStorageAdapter *)storage
                                    options:(nullable PLKRemoteOptions *)options
                                      error:(NSError **)error;
 
 - (nullable PLKRemoteStatus *)statusWithError:(NSError **)error;
-- (nullable PLKCollectionReport *)collect:(nullable PLKRetentionPolicy *)retention
+/// The policy is required: nil and an unbounded policy are refused.
+- (nullable PLKCollectionReport *)collect:(nonnull PLKRetentionPolicy *)retention
                                     error:(NSError **)error;
 - (nullable PLKCollectionReport *)recoverAbandonedCollectionWithError:
     (NSError **)error;
@@ -314,8 +388,20 @@ typedef NS_ENUM(NSInteger, PLKSyncOutcome) {
 /// Owns one explicit transaction inside its block.
 @interface PLKTransaction : NSObject
 
-- (nullable NSArray<NSArray *> *)query:(NSString *)sql
+/// One read on the default engine, which is `PLKQueryEngineSqlite`.
+///
+/// Objective-C has no default arguments, so the engine is a fourth
+/// segment rather than an optional one, and this three-segment selector
+/// stays exactly what it was: every caller written before the parameter
+/// existed keeps compiling and keeps reading the same rows.
+- (nullable PLKRows *)query:(NSString *)sql
                               bindings:(nullable PLKBindings *)bindings
+                                 error:(NSError **)error;
+/// One read, on the engine asked for.
+///
+- (nullable PLKRows *)query:(NSString *)sql
+                              bindings:(nullable PLKBindings *)bindings
+                                engine:(PLKQueryEngine)engine
                                  error:(NSError **)error;
 - (nullable PLKExecuteResult *)execute:(NSString *)sql
                               bindings:(nullable PLKBindings *)bindings
@@ -326,8 +412,13 @@ typedef NS_ENUM(NSInteger, PLKSyncOutcome) {
 /// One explicit connection to a Database.
 @interface PLKConnection : NSObject
 
-- (nullable NSArray<NSArray *> *)query:(NSString *)sql
+- (nullable PLKRows *)query:(NSString *)sql
                               bindings:(nullable PLKBindings *)bindings
+                                 error:(NSError **)error;
+/// One read, on the engine asked for. See `PLKTransaction`.
+- (nullable PLKRows *)query:(NSString *)sql
+                              bindings:(nullable PLKBindings *)bindings
+                                engine:(PLKQueryEngine)engine
                                  error:(NSError **)error;
 - (nullable PLKExecuteResult *)execute:(NSString *)sql
                               bindings:(nullable PLKBindings *)bindings
@@ -345,8 +436,13 @@ typedef NS_ENUM(NSInteger, PLKSyncOutcome) {
 /// One pinned read-only revision session.
 @interface PLKSnapshot : NSObject
 
-- (nullable NSArray<NSArray *> *)query:(NSString *)sql
+- (nullable PLKRows *)query:(NSString *)sql
                               bindings:(nullable PLKBindings *)bindings
+                                 error:(NSError **)error;
+/// One read, on the engine asked for. See `PLKTransaction`.
+- (nullable PLKRows *)query:(NSString *)sql
+                              bindings:(nullable PLKBindings *)bindings
+                                engine:(PLKQueryEngine)engine
                                  error:(NSError **)error;
 - (nullable PLKSnapshotStatus *)statusWithError:(NSError **)error;
 - (BOOL)closeWithError:(NSError **)error;
@@ -366,8 +462,13 @@ typedef NS_ENUM(NSInteger, PLKSyncOutcome) {
                                      options:(nullable PLKOpenOptions *)options
                                        error:(NSError **)error;
 
-- (nullable NSArray<NSArray *> *)query:(NSString *)sql
+- (nullable PLKRows *)query:(NSString *)sql
                               bindings:(nullable PLKBindings *)bindings
+                                 error:(NSError **)error;
+/// One read, on the engine asked for. See `PLKTransaction`.
+- (nullable PLKRows *)query:(NSString *)sql
+                              bindings:(nullable PLKBindings *)bindings
+                                engine:(PLKQueryEngine)engine
                                  error:(NSError **)error;
 - (nullable PLKExecuteResult *)execute:(NSString *)sql
                               bindings:(nullable PLKBindings *)bindings
@@ -398,6 +499,80 @@ typedef NS_ENUM(NSInteger, PLKSyncOutcome) {
                                               revision:
                                                   (nullable PLKRevision *)revision
                                                  error:(NSError **)error;
+
+@end
+
+/// Remotes over object storage, from the shared native storage library.
+///
+/// `PLKRemote remoteFromStorage:` takes a native adapter table the caller
+/// builds. These build none: the semantics, the HTTP and every provider's
+/// credential chain live in `potluckdb-storage`, one native library that
+/// every SDK loads, and all this class does is find it, hand it a JSON
+/// configuration, and give the function table it answers with to
+/// `remoteFromStorage:`.
+///
+/// Its own class rather than three more `PLKRemote` constructors:
+/// `Remote`'s member set is fixed for the SDKs that speak the runtime
+/// interface, and this one keeps the same shape beside it. Each of these
+/// returns an ordinary `PLKRemote`.
+@interface PLKStorage : NSObject
+
+/// A remote over an S3-compatible bucket.
+///
+/// `bucket` holds the objects; the namespace is the prefix this database
+/// lives under, so one bucket can hold many. Credentials come from the
+/// AWS chain unless `accessKeyID` and `secretAccessKey` are both given.
+///
+/// `endpoint` addresses a store that is not AWS's own: Cloudflare R2
+/// issues a pair with an account endpoint and wants `region` "auto", and
+/// MinIO and most self-hosted gateways want `forcePathStyle`, which
+/// addresses the bucket as a path segment rather than as a subdomain.
++ (nullable PLKRemote *)remoteFromS3Bucket:(NSString *)bucket
+                               inNamespace:(NSString *)databaseNamespace
+                                    region:(nullable NSString *)region
+                                  endpoint:(nullable NSString *)endpoint
+                            forcePathStyle:(BOOL)forcePathStyle
+                               accessKeyID:(nullable NSString *)accessKeyID
+                           secretAccessKey:
+                               (nullable NSString *)secretAccessKey
+                              sessionToken:(nullable NSString *)sessionToken
+                                   options:(nullable PLKRemoteOptions *)options
+                                     error:(NSError **)error;
+
+/// A remote over a Google Cloud Storage bucket.
+///
+/// Credentials come from Application Default Credentials unless
+/// `serviceAccount` is given, which is the JSON key Google issues as its
+/// own text.
++ (nullable PLKRemote *)remoteFromGCSBucket:(NSString *)bucket
+                                inNamespace:(NSString *)databaseNamespace
+                                   endpoint:(nullable NSString *)endpoint
+                             serviceAccount:
+                                 (nullable NSString *)serviceAccount
+                                    options:(nullable PLKRemoteOptions *)options
+                                      error:(NSError **)error;
+
+/// A remote over an Azure Blob Storage container.
+///
+/// Credentials come from the Azure chain unless `accountKey` is given.
+/// `endpoint` addresses a store that is not Azure's own; Azurite is one
+/// account under one port, so its endpoint carries the account as a path
+/// segment.
++ (nullable PLKRemote *)remoteFromAzureAccount:(NSString *)account
+                                     container:(NSString *)container
+                                   inNamespace:
+                                       (NSString *)databaseNamespace
+                                      endpoint:(nullable NSString *)endpoint
+                                    accountKey:(nullable NSString *)accountKey
+                                       options:
+                                           (nullable PLKRemoteOptions *)options
+                                         error:(NSError **)error;
+
+/// Where the storage library is for this process.
+///
+/// `POTLUCKDB_STORAGE_LIBRARY` if it is set, otherwise the platform's own
+/// library name, which lets the loader search wherever it searches.
++ (NSString *)libraryPath;
 
 @end
 

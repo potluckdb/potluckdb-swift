@@ -6,11 +6,21 @@
 
 #include "potluckdb.h"
 
+// The storage doors at the end of this file find their library while the
+// program is running rather than at link time, which is the one thing
+// neither C nor Foundation offers. Nothing above them needs any of this,
+// and a program that never opens a remote over object storage never
+// calls into it.
+#include <dlfcn.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+extern uint32_t potluckdb_internal_storage_callback_active_v1(void);
+
 NSErrorDomain const PLKErrorDomain = @"dev.potluckdb.PotluckDB";
 NSErrorUserInfoKey const PLKErrorCodeKey = @"PLKErrorCode";
 NSErrorUserInfoKey const PLKErrorActionKey = @"PLKErrorAction";
-NSErrorUserInfoKey const PLKErrorRetryAfterMillisecondsKey =
-    @"PLKErrorRetryAfterMilliseconds";
 
 static NSString *PLKBufferString(PotluckDbBufferV1 buffer) {
     if (buffer.data == NULL || buffer.length == 0) {
@@ -23,30 +33,68 @@ static NSString *PLKBufferString(PotluckDbBufferV1 buffer) {
     return decoded != nil ? decoded : @"";
 }
 
+// Decodes an SQL value or column name. Foundation's UTF-8 decoding drops a
+// leading U+FEFF as an encoding signature, but in SQL text it is part of the
+// value, so leading ones are decoded here and the rest by Foundation (review
+// round 25 CM-04). Returns nil for bytes that are not UTF-8.
+static NSString *PLKSQLText(const uint8_t *bytes, NSUInteger length) {
+    if (bytes == NULL || length == 0) {
+        return @"";
+    }
+    NSUInteger start = 0;
+    while (start + 3 <= length && bytes[start] == 0xEF &&
+           bytes[start + 1] == 0xBB && bytes[start + 2] == 0xBF) {
+        start += 3;
+    }
+    NSString *rest = [[NSString alloc] initWithBytes:bytes + start
+                                              length:length - start
+                                            encoding:NSUTF8StringEncoding];
+    if (rest == nil || start == 0) {
+        return rest;
+    }
+    NSMutableString *text =
+        [NSMutableString stringWithCapacity:start / 3 + rest.length];
+    for (NSUInteger index = 0; index < start / 3; index += 1) {
+        [text appendFormat:@"%C", (unichar)0xFEFF];
+    }
+    [text appendString:rest];
+    return [text copy];
+}
+
 static NSError *PLKMakeError(NSString *code,
                              PLKErrorCategory category,
                              NSString *message,
-                             NSString *action,
-                             NSNumber *_Nullable retryAfter) {
+                             NSString *action) {
     NSMutableDictionary *info = [NSMutableDictionary dictionary];
     info[PLKErrorCodeKey] = code;
     info[NSLocalizedDescriptionKey] = message;
     info[PLKErrorActionKey] = action;
-    if (retryAfter != nil) {
-        info[PLKErrorRetryAfterMillisecondsKey] = retryAfter;
-    }
     return [NSError errorWithDomain:PLKErrorDomain code:category userInfo:info];
 }
 
 static NSError *PLKInvalidArgument(NSString *message, NSString *action) {
     return PLKMakeError(@"invalid_argument", PLKErrorCategoryCaller, message,
-                        action, nil);
+                        action);
 }
 
 static NSError *PLKInternalFailure(NSString *message) {
     return PLKMakeError(@"internal_failure", PLKErrorCategoryInternal, message,
-                        @"Preserve the failure details and report this error.",
-                        nil);
+                        @"Preserve the failure details and report this error.");
+}
+
+static NSError *_Nullable PLKEngineSelector(PLKQueryEngine engine, uint32_t *selector) {
+    switch (engine) {
+        case PLKQueryEngineSqlite:
+            *selector = POTLUCKDB_QUERY_SQLITE_V1;
+            return nil;
+        case PLKQueryEngineDuckDB:
+            *selector = POTLUCKDB_QUERY_DUCKDB_V1;
+            return nil;
+        default:
+            return PLKInvalidArgument(
+                [NSString stringWithFormat:@"unknown query engine %ld", (long)engine],
+                @"Use 'sqlite' or 'duckdb'.");
+    }
 }
 
 static BOOL PLKFail(NSError **error, NSError *failure) {
@@ -56,6 +104,20 @@ static BOOL PLKFail(NSError **error, NSError *failure) {
     return NO;
 }
 
+/// The NSError an ABI error describes. Its buffers stay with their owner.
+static NSError *PLKErrorFromRaw(const PotluckDbErrorV1 *raw) {
+    PLKErrorCategory category = (PLKErrorCategory)raw->category;
+    if (category < PLKErrorCategoryCaller ||
+        category > PLKErrorCategoryInternal) {
+        category = PLKErrorCategoryInternal;
+    }
+    NSString *code = PLKBufferString(raw->code);
+    NSString *action = [code isEqualToString:@"analytical_engine_unavailable"]
+        ? @"Download the platform DuckDB library from https://docs.potluckdb.com/install/objc/#analytics and set PLKOpenOptions.analyticalEngine to its path."
+        : PLKBufferString(raw->action);
+    return PLKMakeError(code, category, PLKBufferString(raw->message), action);
+}
+
 static BOOL PLKCheck(int32_t result,
                      PotluckDbErrorV1 *raw,
                      NSError **error) {
@@ -63,15 +125,7 @@ static BOOL PLKCheck(int32_t result,
         (void)potluckdb_error_release_v1(raw);
         return YES;
     }
-    PLKErrorCategory category = (PLKErrorCategory)raw->category;
-    if (category < PLKErrorCategoryCaller ||
-        category > PLKErrorCategoryInternal) {
-        category = PLKErrorCategoryInternal;
-    }
-    NSError *failure = PLKMakeError(
-        PLKBufferString(raw->code), category, PLKBufferString(raw->message),
-        PLKBufferString(raw->action),
-        raw->has_retry_after != 0 ? @(raw->retry_after_ms) : nil);
+    NSError *failure = PLKErrorFromRaw(raw);
     (void)potluckdb_error_release_v1(raw);
     return PLKFail(error, failure);
 }
@@ -85,9 +139,14 @@ static PotluckDbSliceV1 PLKSliceFromData(NSData *_Nullable data) {
     return slice;
 }
 
-static NSData *PLKUtf8(NSString *value) {
-    NSData *encoded = [value dataUsingEncoding:NSUTF8StringEncoding];
-    return encoded != nil ? encoded : [NSData data];
+static NSData *_Nullable PLKUtf8(NSString *value) {
+    return [value dataUsingEncoding:NSUTF8StringEncoding];
+}
+
+static NSError *PLKUnencodableText(void) {
+    return PLKInvalidArgument(
+        @"text contains an unpaired surrogate",
+        @"Remove unpaired surrogates and retry.");
 }
 
 typedef NS_ENUM(NSInteger, PLKOwnerKind) {
@@ -113,6 +172,12 @@ typedef NS_ENUM(NSInteger, PLKOwnerKind) {
                     closable:(BOOL)closable
                     retained:(id _Nullable)retained;
 
+- (BOOL)withHandle:(BOOL (^)(uint64_t handle, NSError **error))body
+             error:(NSError **)error;
+- (BOOL)withPair:(PLKHandleState *)other
+            body:(BOOL (^)(uint64_t left, uint64_t right, NSError **error))body
+           error:(NSError **)error;
+
 @end
 
 @implementation PLKHandleState
@@ -132,41 +197,71 @@ typedef NS_ENUM(NSInteger, PLKOwnerKind) {
     return self;
 }
 
-- (void)dealloc {
+- (void)orphanBorrowers {
+    if (_retained != nil) {
+        // A refused destructor leaves native registrations borrowing this owner.
+        (void)CFBridgingRetain(_retained);
+    }
+}
+
+- (BOOL)cleanup {
+    if (potluckdb_internal_storage_callback_active_v1() != 0) { return NO; }
     if (_handle == 0) {
-        return;
+        return YES;
     }
     BOOL needsClose = _closable && !_closed;
     switch (_kind) {
         case PLKOwnerKindRemote:
             if (needsClose) {
-                (void)potluckdb_remote_close_v1(_handle, NULL);
+                if (potluckdb_remote_close_v1(_handle, NULL) != POTLUCKDB_APPLICATION_OK_V1) {
+                    return NO;
+                }
             }
-            (void)potluckdb_remote_release_v1(_handle, NULL);
+            if (potluckdb_remote_release_v1(_handle, NULL) != POTLUCKDB_APPLICATION_OK_V1) {
+                return NO;
+            }
             break;
         case PLKOwnerKindDatabase:
             if (needsClose) {
-                (void)potluckdb_database_close_v1(_handle, NULL);
+                if (potluckdb_database_close_v1(_handle, NULL) != POTLUCKDB_APPLICATION_OK_V1) {
+                    return NO;
+                }
             }
-            (void)potluckdb_database_release_v1(_handle, NULL);
+            if (potluckdb_database_release_v1(_handle, NULL) != POTLUCKDB_APPLICATION_OK_V1) {
+                return NO;
+            }
             break;
         case PLKOwnerKindConnection:
             if (needsClose) {
-                (void)potluckdb_connection_close_v1(_handle, NULL);
+                if (potluckdb_connection_close_v1(_handle, NULL) != POTLUCKDB_APPLICATION_OK_V1) {
+                    return NO;
+                }
             }
-            (void)potluckdb_connection_release_v1(_handle, NULL);
+            if (potluckdb_connection_release_v1(_handle, NULL) != POTLUCKDB_APPLICATION_OK_V1) {
+                return NO;
+            }
             break;
         case PLKOwnerKindSnapshot:
             if (needsClose) {
-                (void)potluckdb_snapshot_close_v1(_handle, NULL);
+                if (potluckdb_snapshot_close_v1(_handle, NULL) != POTLUCKDB_APPLICATION_OK_V1) {
+                    return NO;
+                }
             }
-            (void)potluckdb_snapshot_release_v1(_handle, NULL);
+            if (potluckdb_snapshot_release_v1(_handle, NULL) != POTLUCKDB_APPLICATION_OK_V1) {
+                return NO;
+            }
             break;
         case PLKOwnerKindTransaction:
             (void)potluckdb_transaction_release_v1(_handle, NULL);
             break;
     }
     _handle = 0;
+    _retained = nil;
+    return YES;
+}
+
+- (void)dealloc {
+    if (![self cleanup]) { [self orphanBorrowers]; }
 }
 
 - (BOOL)withHandle:(BOOL (^)(uint64_t handle, NSError **error))body
@@ -180,15 +275,42 @@ typedef NS_ENUM(NSInteger, PLKOwnerKind) {
             error,
             PLKMakeError(@"invalid_state", PLKErrorCategoryCaller,
                          @"potluckdb owner is released",
-                         @"Open a new owner and retry.", nil));
+                         @"Open a new owner and retry."));
     }
     BOOL outcome = body(handle, error);
     [_lock unlock];
     return outcome;
 }
 
+- (BOOL)withPair:(PLKHandleState *)other
+            body:(BOOL (^)(uint64_t left, uint64_t right, NSError **error))body
+           error:(NSError **)error {
+    PLKHandleState *first = (uintptr_t)self < (uintptr_t)other ? self : other;
+    PLKHandleState *second = first == self ? other : self;
+    [first->_lock lock];
+    [second->_lock lock];
+    BOOL outcome;
+    if (self->_handle == 0 || other->_handle == 0) {
+        outcome = PLKFail(
+            error,
+            PLKMakeError(@"invalid_state", PLKErrorCategoryCaller,
+                         @"potluckdb Remote is released",
+                         @"Open new Remote values and retry."));
+    } else {
+        outcome = body(self->_handle, other->_handle, error);
+    }
+    [second->_lock unlock];
+    [first->_lock unlock];
+    return outcome;
+}
+
 - (BOOL)closeUsing:(int32_t (*)(uint64_t, PotluckDbErrorV1 *))call
              error:(NSError **)error {
+    if (potluckdb_internal_storage_callback_active_v1() != 0) {
+        return PLKFail(error, PLKMakeError(@"invalid_state", PLKErrorCategoryCaller,
+            @"recursive close from a storage callback is refused",
+            @"Close the owner after the callback returns."));
+    }
     [_lock lock];
     if (_handle == 0 || _closed) {
         [_lock unlock];
@@ -214,7 +336,7 @@ typedef NS_ENUM(NSInteger, PLKOwnerKind) {
     PotluckDbErrorV1 raw;
     potluckdb_error_init_v1(&raw);
     BOOL outcome = PLKCheck(call(_handle, &raw), &raw, error);
-    if (outcome) {
+    if (outcome || _kind == PLKOwnerKindTransaction) {
         _handle = 0;
         _retained = nil;
     }
@@ -248,6 +370,10 @@ typedef NS_ENUM(NSInteger, PLKOwnerKind) {
 
 + (instancetype)parse:(NSString *)text error:(NSError **)error {
     NSData *encoded = PLKUtf8(text);
+    if (encoded == nil) {
+        PLKFail(error, PLKUnencodableText());
+        return nil;
+    }
     PotluckDbRevisionV1 raw;
     memset(&raw, 0, sizeof(raw));
     PotluckDbErrorV1 failure;
@@ -475,6 +601,7 @@ typedef NS_ENUM(NSInteger, PLKOwnerKind) {
   @public
     uint64_t _keepLast;
     uint64_t _collectAt;
+    BOOL _unbounded;
 }
 
 + (instancetype)boundedWithKeepLast:(uint64_t)keepLast
@@ -491,6 +618,16 @@ typedef NS_ENUM(NSInteger, PLKOwnerKind) {
     policy->_keepLast = keepLast;
     policy->_collectAt = collectAt;
     return policy;
+}
+
++ (instancetype)unboundedPolicy {
+    PLKRetentionPolicy *policy = [[PLKRetentionPolicy alloc] init];
+    policy->_unbounded = YES;
+    return policy;
+}
+
+- (BOOL)bounded {
+    return !_unbounded;
 }
 
 + (instancetype)boundedPolicy {
@@ -511,7 +648,7 @@ typedef NS_ENUM(NSInteger, PLKOwnerKind) {
     self = [super init];
     if (self != nil) {
         _timeoutMilliseconds = 5000;
-        _maximumRows = 100000;
+        _maximumRows = 1000000;
         _prefetch = [PLKPrefetchPolicy automaticPolicy];
         _checkpoint = [PLKCheckpointPolicy automaticPolicy];
     }
@@ -519,6 +656,12 @@ typedef NS_ENUM(NSInteger, PLKOwnerKind) {
 }
 
 - (BOOL)fill:(PotluckDbConnectionOptionsV1 *)raw error:(NSError **)error {
+    if (_prefetch == nil || _checkpoint == nil) {
+        return PLKFail(error,
+                       PLKInvalidArgument(
+                           @"prefetch and checkpoint policies must not be nil",
+                           @"Set both policies and retry."));
+    }
     if (_timeoutMilliseconds > 86400000 || _maximumRows == 0) {
         return PLKFail(
             error,
@@ -559,7 +702,14 @@ typedef NS_ENUM(NSInteger, PLKOwnerKind) {
 
 - (BOOL)fill:(PotluckDbOpenOptionsV1 *)raw
     clientIdentity:(NSData *_Nullable *_Nonnull)clientIdentity
+        licenseKey:(NSData *_Nullable *_Nonnull)licenseKey
+  analyticalEngine:(NSData *_Nullable *_Nonnull)analyticalEngine
              error:(NSError **)error {
+    if (_connection == nil) {
+        return PLKFail(error,
+                       PLKInvalidArgument(@"connection options must not be nil",
+                                          @"Set connection options and retry."));
+    }
     if (_localBudgetBytes < _minimumLocalBudgetBytes) {
         return PLKFail(
             error,
@@ -608,8 +758,30 @@ typedef NS_ENUM(NSInteger, PLKOwnerKind) {
     }
     if (_clientID != nil) {
         *clientIdentity = PLKUtf8(_clientID);
+        if (*clientIdentity == nil) {
+            PLKFail(error, PLKUnencodableText());
+            return NO;
+        }
         raw->flags |= POTLUCKDB_OPEN_CLIENT_ID_V1;
         raw->client_id = PLKSliceFromData(*clientIdentity);
+    }
+    if (_licenseKey != nil) {
+        *licenseKey = PLKUtf8(_licenseKey);
+        if (*licenseKey == nil) {
+            PLKFail(error, PLKUnencodableText());
+            return NO;
+        }
+        raw->flags |= POTLUCKDB_OPEN_LICENSE_KEY_V1;
+        raw->license_key = PLKSliceFromData(*licenseKey);
+    }
+    if (_analyticalEngine != nil) {
+        *analyticalEngine = PLKUtf8(_analyticalEngine);
+        if (*analyticalEngine == nil) {
+            PLKFail(error, PLKUnencodableText());
+            return NO;
+        }
+        raw->flags |= POTLUCKDB_OPEN_ANALYTICAL_ENGINE_V1;
+        raw->analytical_engine = PLKSliceFromData(*analyticalEngine);
     }
     return YES;
 }
@@ -623,8 +795,13 @@ typedef NS_ENUM(NSInteger, PLKOwnerKind) {
     if (self != nil) {
         _readConcurrency = 32;
         _writeConcurrency = 16;
+        _retention = [PLKRetentionPolicy boundedPolicy];
     }
     return self;
+}
+
+- (void)setRetention:(PLKRetentionPolicy *)retention {
+    _retention = retention != nil ? retention : [PLKRetentionPolicy boundedPolicy];
 }
 
 - (BOOL)fill:(PotluckDbRemoteOptionsV1 *)raw error:(NSError **)error {
@@ -639,7 +816,8 @@ typedef NS_ENUM(NSInteger, PLKOwnerKind) {
     potluckdb_remote_options_init_v1(raw);
     raw->read_concurrency = _readConcurrency;
     raw->write_concurrency = _writeConcurrency;
-    if (_retention != nil) {
+    raw->flags &= ~POTLUCKDB_REMOTE_RETENTION_V1;
+    if (_retention.bounded) {
         raw->flags |= POTLUCKDB_REMOTE_RETENTION_V1;
         [_retention fill:&raw->retention];
     }
@@ -702,6 +880,11 @@ typedef NS_ENUM(NSInteger, PLKOwnerKind) {
         potluckdb_binding_init_v1(&items[index]);
         if (_names != nil) {
             NSData *name = PLKUtf8(_names[index]);
+            if (name == nil) {
+                PLKFail(error, PLKUnencodableText());
+                prepared = NO;
+                continue;
+            }
             [buffers addObject:name];
             items[index].name = PLKSliceFromData(name);
         }
@@ -720,11 +903,33 @@ typedef NS_ENUM(NSInteger, PLKOwnerKind) {
                 items[index].value.kind = POTLUCKDB_VALUE_REAL_V1;
                 items[index].value.real_value = number.doubleValue;
             } else {
-                items[index].value.kind = POTLUCKDB_VALUE_INTEGER_V1;
-                items[index].value.integer_value = number.longLongValue;
+                const char *type = number.objCType;
+                if ((strcmp(type, @encode(unsigned char)) == 0 ||
+                     strcmp(type, @encode(unsigned short)) == 0 ||
+                     strcmp(type, @encode(unsigned int)) == 0 ||
+                     strcmp(type, @encode(unsigned long)) == 0 ||
+                     strcmp(type, @encode(unsigned long long)) == 0) &&
+                    number.unsignedLongLongValue >
+                        (unsigned long long)INT64_MAX) {
+                    PLKFail(
+                        error,
+                        PLKInvalidArgument(
+                            @"integer bindings must fit in a signed 64-bit value",
+                            @"Bind a value between -9223372036854775808 and "
+                            @"9223372036854775807 and retry."));
+                    prepared = NO;
+                } else {
+                    items[index].value.kind = POTLUCKDB_VALUE_INTEGER_V1;
+                    items[index].value.integer_value = number.longLongValue;
+                }
             }
         } else if ([value isKindOfClass:[NSString class]]) {
             NSData *text = PLKUtf8(value);
+            if (text == nil) {
+                PLKFail(error, PLKUnencodableText());
+                prepared = NO;
+                continue;
+            }
             [buffers addObject:text];
             items[index].value.kind = POTLUCKDB_VALUE_TEXT_V1;
             items[index].value.bytes = PLKSliceFromData(text);
@@ -753,6 +958,129 @@ typedef NS_ENUM(NSInteger, PLKOwnerKind) {
 
 @end
 
+@implementation PLKRow {
+    NSArray<NSString *> *_columns;
+    NSArray *_values;
+}
+
+- (instancetype)initWithColumns:(NSArray<NSString *> *)columns
+                         values:(NSArray *)values {
+    self = [super init];
+    if (self != nil) {
+        _columns = columns;
+        _values = values;
+    }
+    return self;
+}
+
+- (NSArray<NSString *> *)columns {
+    return _columns;
+}
+
+- (NSArray *)values {
+    return _values;
+}
+
+- (NSUInteger)count {
+    return _values.count;
+}
+
+- (id)objectAtIndexedSubscript:(NSUInteger)index {
+    return _values[index];
+}
+
+- (id)objectForKeyedSubscript:(NSString *)column {
+    for (NSUInteger index = _columns.count; index > 0; index -= 1) {
+        if ([_columns[index - 1] isEqualToString:column]) {
+            return _values[index - 1];
+        }
+    }
+    return nil;
+}
+
+- (BOOL)isEqual:(id)object {
+    if (object == self) {
+        return YES;
+    }
+    if (![object isKindOfClass:[PLKRow class]]) {
+        return NO;
+    }
+    PLKRow *other = object;
+    return [_columns isEqualToArray:other->_columns] &&
+           [_values isEqualToArray:other->_values];
+}
+
+- (NSUInteger)hash {
+    return _columns.hash ^ _values.hash;
+}
+
+- (NSUInteger)countByEnumeratingWithState:(NSFastEnumerationState *)state
+                                  objects:(id __unsafe_unretained _Nonnull[])buffer
+                                    count:(NSUInteger)length {
+    return [_values countByEnumeratingWithState:state
+                                        objects:buffer
+                                          count:length];
+}
+
+@end
+
+@implementation PLKRows {
+    NSArray<NSString *> *_columns;
+    NSArray<PLKRow *> *_rows;
+}
+
+- (instancetype)initWithColumns:(NSArray<NSString *> *)columns
+                           rows:(NSArray<PLKRow *> *)rows {
+    self = [super init];
+    if (self != nil) {
+        _columns = columns;
+        _rows = rows;
+    }
+    return self;
+}
+
+- (NSArray<NSString *> *)columns {
+    return _columns;
+}
+
+- (NSArray<PLKRow *> *)rows {
+    return _rows;
+}
+
+- (NSUInteger)count {
+    return _rows.count;
+}
+
+- (PLKRow *)objectAtIndexedSubscript:(NSUInteger)index {
+    return _rows[index];
+}
+
+- (BOOL)isEqual:(id)object {
+    if (object == self) {
+        return YES;
+    }
+    if (![object isKindOfClass:[PLKRows class]]) {
+        return NO;
+    }
+    PLKRows *other = object;
+    return [_columns isEqualToArray:other->_columns] &&
+           [_rows isEqualToArray:other->_rows];
+}
+
+- (NSUInteger)hash {
+    return _columns.hash ^ _rows.hash;
+}
+
+- (NSUInteger)countByEnumeratingWithState:(NSFastEnumerationState *)state
+                                  objects:(id __unsafe_unretained _Nonnull[])buffer
+                                    count:(NSUInteger)length {
+    return [_rows countByEnumeratingWithState:state
+                                      objects:buffer
+                                        count:length];
+}
+
+@end
+
 @implementation PLKExecuteResult {
   @public
     int64_t _rowsAffected;
@@ -769,11 +1097,35 @@ typedef NS_ENUM(NSInteger, PLKOwnerKind) {
 
 @end
 
-static NSArray *_Nullable PLKCopyRows(PotluckDbRowsHandleV1 handle,
+static PLKRows *_Nullable PLKCopyRows(PotluckDbRowsHandleV1 handle,
                                       NSError **error) {
     NSMutableArray *rows = nil;
     uint64_t rowCount = 0;
     PotluckDbErrorV1 failure;
+    potluckdb_error_init_v1(&failure);
+    uint64_t nameCount = 0;
+    if (!PLKCheck(potluckdb_rows_column_name_count_v1(handle, &nameCount,
+                                                      &failure),
+                  &failure, error)) {
+        (void)potluckdb_rows_release_v1(handle, NULL);
+        return nil;
+    }
+    NSMutableArray<NSString *> *columns =
+        [NSMutableArray arrayWithCapacity:(NSUInteger)nameCount];
+    for (uint64_t column = 0; column < nameCount; column += 1) {
+        PotluckDbSliceV1 name = {0};
+        potluckdb_error_init_v1(&failure);
+        if (!PLKCheck(potluckdb_rows_column_name_v1(handle, column, &name,
+                                                    &failure),
+                      &failure, error)) {
+            (void)potluckdb_rows_release_v1(handle, NULL);
+            return nil;
+        }
+        NSString *text =
+            PLKSQLText((const uint8_t *)name.data, (NSUInteger)name.length);
+        [columns addObject:text != nil ? text : @""];
+    }
+    NSArray<NSString *> *names = [columns copy];
     potluckdb_error_init_v1(&failure);
     if (!PLKCheck(potluckdb_rows_row_count_v1(handle, &rowCount, &failure),
                   &failure, error)) {
@@ -808,7 +1160,7 @@ static NSArray *_Nullable PLKCopyRows(PotluckDbRowsHandleV1 handle,
                     [values addObject:[NSNull null]];
                     break;
                 case POTLUCKDB_VALUE_BOOLEAN_V1:
-                    [values addObject:@(value.boolean_value != 0)];
+                    [values addObject:value.boolean_value ? @YES : @NO];
                     break;
                 case POTLUCKDB_VALUE_INTEGER_V1:
                     [values addObject:@(value.integer_value)];
@@ -817,11 +1169,17 @@ static NSArray *_Nullable PLKCopyRows(PotluckDbRowsHandleV1 handle,
                     [values addObject:@(value.real_value)];
                     break;
                 case POTLUCKDB_VALUE_TEXT_V1: {
-                    NSString *text = [[NSString alloc]
-                        initWithBytes:value.bytes.data
-                               length:(NSUInteger)value.bytes.length
-                             encoding:NSUTF8StringEncoding];
-                    [values addObject:text != nil ? text : @""];
+                    NSString *text = PLKSQLText(
+                        (const uint8_t *)value.bytes.data,
+                        (NSUInteger)value.bytes.length);
+                    if (text == nil) {
+                        (void)potluckdb_rows_release_v1(handle, NULL);
+                        PLKFail(error,
+                                PLKInternalFailure(
+                                    @"potluckdb returned text that is not UTF-8"));
+                        return nil;
+                    }
+                    [values addObject:text];
                     break;
                 }
                 case POTLUCKDB_VALUE_BLOB_V1:
@@ -838,14 +1196,14 @@ static NSArray *_Nullable PLKCopyRows(PotluckDbRowsHandleV1 handle,
                     return nil;
             }
         }
-        [rows addObject:values];
+        [rows addObject:[[PLKRow alloc] initWithColumns:names values:values]];
     }
     potluckdb_error_init_v1(&failure);
     if (!PLKCheck(potluckdb_rows_release_v1(handle, &failure), &failure,
                   error)) {
         return nil;
     }
-    return rows;
+    return [[PLKRows alloc] initWithColumns:names rows:[rows copy]];
 }
 
 static NSArray<NSString *> *_Nullable PLKCopyStrings(
@@ -933,6 +1291,7 @@ static NSString *PLKBackgroundStateName(uint32_t value) {
     NSArray<NSString *> *_Nullable _replayed;
     NSArray<NSString *> *_Nullable _quarantined;
     NSString *_Nullable _conflictReason;
+    NSError *_Nullable _error;
 }
 
 - (PLKSyncOutcome)outcome {
@@ -955,7 +1314,83 @@ static NSString *PLKBackgroundStateName(uint32_t value) {
     return _conflictReason;
 }
 
+- (NSError *)error {
+    return _error;
+}
+
 @end
+
+/// The facade's reading of one raw synchronization outcome. The raw value
+/// stays with its owner; the caller releases it.
+static PLKSyncResult *_Nullable PLKSyncResultFromRaw(
+    const PotluckDbSyncResultV1 *output, NSError **error) {
+    PLKSyncResult *result = [[PLKSyncResult alloc] init];
+    result->_outcome = (PLKSyncOutcome)output->kind;
+    switch (output->kind) {
+        case POTLUCKDB_SYNC_UP_TO_DATE_V1:
+        case POTLUCKDB_SYNC_CONFLICT_V1:
+            if (output->has_revision != 0) {
+                result->_revision = [PLKRevision revisionWithRaw:output->revision];
+            }
+            if (output->kind == POTLUCKDB_SYNC_CONFLICT_V1) {
+                result->_conflictReason = PLKBufferString(output->reason);
+            }
+            return result;
+        case POTLUCKDB_SYNC_PUSHED_V1:
+            result->_revision = [PLKRevision revisionWithRaw:output->revision];
+            return result;
+        case POTLUCKDB_SYNC_PULLED_V1:
+            result->_revision = [PLKRevision revisionWithRaw:output->revision];
+            result->_replayed = PLKCopyStrings(output->replayed, error);
+            if (result->_replayed == nil) {
+                return nil;
+            }
+            result->_quarantined = PLKCopyStrings(output->quarantined, error);
+            return result->_quarantined == nil ? nil : result;
+        case POTLUCKDB_SYNC_FAILED_V1:
+            result->_error = PLKErrorFromRaw(&output->error);
+            return result;
+        default:
+            PLKFail(error,
+                    PLKInternalFailure(
+                        @"potluckdb returned an unknown synchronization result"));
+            return nil;
+    }
+}
+
+/// The registered `PLKOpenOptions.onSync`. The database that registered
+/// it retains it until its handle is released; the runtime returns from
+/// close only after the hook's last invocation.
+@interface PLKSyncHook : NSObject {
+  @public
+    void (^_block)(PLKSyncResult *outcome);
+}
+@end
+
+@implementation PLKSyncHook
+@end
+
+/// `PotluckDbOnSyncV1`. An outcome the facade cannot read is delivered as
+/// a Failed result carrying the facade's error. The pool is this thread's
+/// only one: the runtime's thread brings none.
+static void PLKDeliverSync(void *context, PotluckDbSyncResultV1 outcome) {
+    @autoreleasepool {
+        NSError *failure = nil;
+        PLKSyncResult *result = PLKSyncResultFromRaw(&outcome, &failure);
+        (void)potluckdb_sync_result_release_v1(&outcome);
+        if (result == nil) {
+            result = [[PLKSyncResult alloc] init];
+            result->_outcome = PLKSyncOutcomeFailed;
+            result->_error =
+                failure != nil
+                    ? failure
+                    : PLKInternalFailure(
+                          @"potluckdb returned an unreadable synchronization result");
+        }
+        PLKSyncHook *hook = (__bridge PLKSyncHook *)context;
+        hook->_block(result);
+    }
+}
 
 @implementation PLKConflictResolution {
   @public
@@ -1350,7 +1785,7 @@ static NSString *PLKBackgroundStateName(uint32_t value) {
 @end
 
 typedef int32_t (*PLKQueryFunction)(uint64_t, PotluckDbSliceV1,
-                                    const PotluckDbBindingsV1 *,
+                                    const PotluckDbBindingsV1 *, uint32_t,
                                     PotluckDbRowsHandleV1 *,
                                     PotluckDbErrorV1 *);
 typedef int32_t (*PLKExecuteFunction)(uint64_t, PotluckDbSliceV1,
@@ -1358,10 +1793,11 @@ typedef int32_t (*PLKExecuteFunction)(uint64_t, PotluckDbSliceV1,
                                       PotluckDbExecuteResultV1 *, uint32_t,
                                       PotluckDbErrorV1 *);
 
-static NSArray *_Nullable PLKRunQuery(PLKHandleState *state,
+static PLKRows *_Nullable PLKRunQuery(PLKHandleState *state,
                                       PLKQueryFunction function,
                                       NSString *sql,
                                       PLKBindings *_Nullable bindings,
+                                      PLKQueryEngine engine,
                                       NSError **error);
 static PLKExecuteResult *_Nullable PLKRunExecute(
     PLKHandleState *state, PLKExecuteFunction function, NSString *sql,
@@ -1383,11 +1819,24 @@ static PLKExecuteResult *_Nullable PLKRunExecute(
     return transaction;
 }
 
-- (NSArray<NSArray *> *)query:(NSString *)sql
+// The three-segment selector is the four-segment one with the default
+// engine. Written this way rather than as two calls into PLKRunQuery so
+// there is one place per owner where the engine can be lost.
+- (PLKRows *)query:(NSString *)sql
                      bindings:(PLKBindings *)bindings
                         error:(NSError **)error {
-    return PLKRunQuery(_state, potluckdb_transaction_query_v1, sql, bindings,
-                       error);
+    return [self query:sql
+              bindings:bindings
+                engine:PLKQueryEngineSqlite
+                 error:error];
+}
+
+- (PLKRows *)query:(NSString *)sql
+                     bindings:(PLKBindings *)bindings
+                       engine:(PLKQueryEngine)engine
+                        error:(NSError **)error {
+    return PLKRunQuery(_state, potluckdb_transaction_query_with_engine_v1, sql, bindings,
+                       engine, error);
 }
 
 - (PLKExecuteResult *)execute:(NSString *)sql
@@ -1426,14 +1875,27 @@ static PLKExecuteResult *_Nullable PLKRunExecute(
 
 @end
 
-static NSArray *_Nullable PLKRunQuery(PLKHandleState *state,
+static PLKRows *_Nullable PLKRunQuery(PLKHandleState *state,
                                       PLKQueryFunction function,
                                       NSString *sql,
                                       PLKBindings *_Nullable bindings,
+                                      PLKQueryEngine engine,
                                       NSError **error) {
+    // Before the handle, so all four readers refuse identically and a
+    // refusal does not depend on the session being open.
+    uint32_t selector = POTLUCKDB_QUERY_SQLITE_V1;
+    NSError *refused = PLKEngineSelector(engine, &selector);
+    if (refused != nil) {
+        (void)PLKFail(error, refused);
+        return nil;
+    }
     PLKBindings *selected = bindings != nil ? bindings : [PLKBindings none];
     NSData *encoded = PLKUtf8(sql);
-    __block NSArray *rows = nil;
+    if (encoded == nil) {
+        PLKFail(error, PLKUnencodableText());
+        return nil;
+    }
+    __block PLKRows *rows = nil;
     BOOL outcome = [state withHandle:^BOOL(uint64_t handle,
                                            NSError **bodyError) {
         return [selected withRaw:^BOOL(const PotluckDbBindingsV1 *raw,
@@ -1441,7 +1903,7 @@ static NSArray *_Nullable PLKRunQuery(PLKHandleState *state,
             PotluckDbRowsHandleV1 output = 0;
             PotluckDbErrorV1 failure;
             potluckdb_error_init_v1(&failure);
-            if (!PLKCheck(function(handle, PLKSliceFromData(encoded), raw,
+            if (!PLKCheck(function(handle, PLKSliceFromData(encoded), raw, selector,
                                    &output, &failure),
                           &failure, innerError)) {
                 return NO;
@@ -1460,6 +1922,10 @@ static PLKExecuteResult *_Nullable PLKRunExecute(
     PLKBindings *_Nullable bindings, NSError **error) {
     PLKBindings *selected = bindings != nil ? bindings : [PLKBindings none];
     NSData *encoded = PLKUtf8(sql);
+    if (encoded == nil) {
+        PLKFail(error, PLKUnencodableText());
+        return nil;
+    }
     __block PLKExecuteResult *result = nil;
     BOOL outcome = [state withHandle:^BOOL(uint64_t handle,
                                            NSError **bodyError) {
@@ -1496,6 +1962,11 @@ static BOOL PLKRunTransaction(PLKHandleState *owner,
                               NSError **error,
                               BOOL (^block)(PLKTransaction *transaction,
                                             NSError **blockError)) {
+    if (mode != PLKTransactionModeDeferred && mode != PLKTransactionModeImmediate &&
+        mode != PLKTransactionModeExclusive) {
+        return PLKFail(error, PLKInvalidArgument(@"transaction mode is invalid",
+            @"Use deferred, immediate, or exclusive transaction mode."));
+    }
     __block uint64_t transactionHandle = 0;
     BOOL began = [owner withHandle:^BOOL(uint64_t handle, NSError **bodyError) {
         PotluckDbErrorV1 failure;
@@ -1511,7 +1982,14 @@ static BOOL PLKRunTransaction(PLKHandleState *owner,
     PLKTransaction *transaction =
         [PLKTransaction transactionWithHandle:transactionHandle owner:owner];
     NSError *blockFailure = nil;
-    if (!block(transaction, &blockFailure)) {
+    BOOL blockSuccess = NO;
+    @try {
+        blockSuccess = block(transaction, &blockFailure);
+    } @catch (NSException *exception) {
+        [transaction rollbackQuietly];
+        @throw;
+    }
+    if (!blockSuccess) {
         [transaction rollbackQuietly];
         NSError *reported =
             blockFailure != nil
@@ -1520,7 +1998,11 @@ static BOOL PLKRunTransaction(PLKHandleState *owner,
                       @"the transaction block failed without an error");
         return PLKFail(error, reported);
     }
-    return [transaction commitWithError:error];
+    if (![transaction commitWithError:error]) {
+        [transaction rollbackQuietly];
+        return NO;
+    }
+    return YES;
 }
 
 @implementation PLKConnection {
@@ -1528,11 +2010,21 @@ static BOOL PLKRunTransaction(PLKHandleState *owner,
     PLKHandleState *_state;
 }
 
-- (NSArray<NSArray *> *)query:(NSString *)sql
+- (PLKRows *)query:(NSString *)sql
                      bindings:(PLKBindings *)bindings
                         error:(NSError **)error {
-    return PLKRunQuery(_state, potluckdb_connection_query_v1, sql, bindings,
-                       error);
+    return [self query:sql
+              bindings:bindings
+                engine:PLKQueryEngineSqlite
+                 error:error];
+}
+
+- (PLKRows *)query:(NSString *)sql
+                     bindings:(PLKBindings *)bindings
+                       engine:(PLKQueryEngine)engine
+                        error:(NSError **)error {
+    return PLKRunQuery(_state, potluckdb_connection_query_with_engine_v1, sql, bindings,
+                       engine, error);
 }
 
 - (PLKExecuteResult *)execute:(NSString *)sql
@@ -1629,11 +2121,21 @@ static BOOL PLKRunTransaction(PLKHandleState *owner,
     PLKHandleState *_state;
 }
 
-- (NSArray<NSArray *> *)query:(NSString *)sql
+- (PLKRows *)query:(NSString *)sql
                      bindings:(PLKBindings *)bindings
                         error:(NSError **)error {
-    return PLKRunQuery(_state, potluckdb_snapshot_query_v1, sql, bindings,
-                       error);
+    return [self query:sql
+              bindings:bindings
+                engine:PLKQueryEngineSqlite
+                 error:error];
+}
+
+- (PLKRows *)query:(NSString *)sql
+                     bindings:(PLKBindings *)bindings
+                       engine:(PLKQueryEngine)engine
+                        error:(NSError **)error {
+    return PLKRunQuery(_state, potluckdb_snapshot_query_with_engine_v1, sql, bindings,
+                       engine, error);
 }
 
 - (PLKSnapshotStatus *)statusWithError:(NSError **)error {
@@ -1680,6 +2182,10 @@ static BOOL PLKRunTransaction(PLKHandleState *owner,
         return nil;
     }
     NSData *encoded = PLKUtf8(path);
+    if (encoded == nil) {
+        PLKFail(error, PLKUnencodableText());
+        return nil;
+    }
     PotluckDbRemoteHandleV1 handle = 0;
     PotluckDbErrorV1 failure;
     potluckdb_error_init_v1(&failure);
@@ -1699,6 +2205,12 @@ static BOOL PLKRunTransaction(PLKHandleState *owner,
 + (instancetype)remoteFromStorage:(PLKStorageAdapter *)storage
                           options:(PLKRemoteOptions *)options
                             error:(NSError **)error {
+    if (storage == nil || storage->_pointer == NULL) {
+        PLKFail(error,
+                PLKInvalidArgument(@"storage must not be nil",
+                                   @"Supply a storage adapter and retry."));
+        return nil;
+    }
     PLKRemoteOptions *selected =
         options != nil ? options : [[PLKRemoteOptions alloc] init];
     PotluckDbRemoteOptionsV1 raw;
@@ -1750,8 +2262,19 @@ static BOOL PLKRunTransaction(PLKHandleState *owner,
 
 - (PLKCollectionReport *)collect:(PLKRetentionPolicy *)retention
                            error:(NSError **)error {
-    PLKRetentionPolicy *selected =
-        retention != nil ? retention : [PLKRetentionPolicy boundedPolicy];
+    if (retention == nil) {
+        PLKFail(error, PLKInvalidArgument(
+            @"collect needs an explicit retention policy",
+            @"Pass [PLKRetentionPolicy boundedPolicy]."));
+        return nil;
+    }
+    PLKRetentionPolicy *selected = retention;
+    if (!selected.bounded) {
+        PLKFail(error, PLKInvalidArgument(
+            @"collect needs a bounded retention policy",
+            @"Pass [PLKRetentionPolicy boundedPolicy]."));
+        return nil;
+    }
     __block PLKCollectionReport *report = nil;
     BOOL outcome = [_state withHandle:^BOOL(uint64_t handle,
                                             NSError **bodyError) {
@@ -1800,6 +2323,21 @@ static BOOL PLKRunTransaction(PLKHandleState *owner,
 
 @end
 
+// Review round 19 BN-03: a Remote this library did not open, nil or
+// [[PLKRemote alloc] init], has no handle, and reaching through it would end
+// the process; it is refused as a caller error instead.
+static BOOL PLKRequireOpenedRemote(PLKRemote *_Nullable remote,
+                                   NSError **error) {
+    if (remote != nil && remote->_state != nil) {
+        return YES;
+    }
+    return PLKFail(error,
+                   PLKInvalidArgument(
+                       @"remote was not opened by this library",
+                       @"Open the remote with remoteFromDirectory, "
+                       @"remoteFromStorage or a storage factory and retry."));
+}
+
 @implementation PLKDatabase {
   @public
     PLKHandleState *_state;
@@ -1809,14 +2347,31 @@ static BOOL PLKRunTransaction(PLKHandleState *owner,
                     remote:(PLKRemote *)remote
                    options:(PLKOpenOptions *)options
                      error:(NSError **)error {
+    if (remote != nil && !PLKRequireOpenedRemote(remote, error)) {
+        return nil;
+    }
     PLKOpenOptions *selected =
         options != nil ? options : [[PLKOpenOptions alloc] init];
     PotluckDbOpenOptionsV1 raw;
-    NSData *clientIdentity = nil;
-    if (![selected fill:&raw clientIdentity:&clientIdentity error:error]) {
+    __attribute__((objc_precise_lifetime)) NSData *clientIdentity = nil;
+    __attribute__((objc_precise_lifetime)) NSData *licenseKey = nil;
+    __attribute__((objc_precise_lifetime)) NSData *analyticalEngine = nil;
+    if (![selected fill:&raw clientIdentity:&clientIdentity
+            licenseKey:&licenseKey analyticalEngine:&analyticalEngine error:error]) {
         return nil;
     }
     NSData *encoded = PLKUtf8(path);
+    if (encoded == nil) {
+        PLKFail(error, PLKUnencodableText());
+        return nil;
+    }
+    PLKSyncHook *hook = nil;
+    if (selected.onSync != nil) {
+        hook = [[PLKSyncHook alloc] init];
+        hook->_block = selected.onSync;
+        raw.on_sync = PLKDeliverSync;
+        raw.on_sync_context = (__bridge void *)hook;
+    }
     __block PotluckDbDatabaseHandleV1 handle = 0;
     BOOL (^open)(uint64_t, NSError **) = ^BOOL(uint64_t remoteHandle,
                                                NSError **bodyError) {
@@ -1829,11 +2384,11 @@ static BOOL PLKRunTransaction(PLKHandleState *owner,
                         &failure, bodyError);
     };
     BOOL opened;
-    PLKHandleState *retained = nil;
+    id retained = hook;
     if (remote == nil) {
         opened = open(0, error);
     } else {
-        retained = remote->_state;
+        retained = hook == nil ? remote->_state : @[ remote->_state, hook ];
         opened = [remote->_state withHandle:open error:error];
     }
     (void)clientIdentity;
@@ -1853,14 +2408,29 @@ static BOOL PLKRunTransaction(PLKHandleState *owner,
                              remote:(PLKRemote *)remote
                             options:(PLKOpenOptions *)options
                               error:(NSError **)error {
+    if (revision == nil) {
+        PLKFail(error, PLKInvalidArgument(@"revision must not be nil",
+                                          @"Supply a revision and retry."));
+        return nil;
+    }
+    if (!PLKRequireOpenedRemote(remote, error)) {
+        return nil;
+    }
     PLKOpenOptions *selected =
         options != nil ? options : [[PLKOpenOptions alloc] init];
     PotluckDbOpenOptionsV1 raw;
-    NSData *clientIdentity = nil;
-    if (![selected fill:&raw clientIdentity:&clientIdentity error:error]) {
+    __attribute__((objc_precise_lifetime)) NSData *clientIdentity = nil;
+    __attribute__((objc_precise_lifetime)) NSData *licenseKey = nil;
+    __attribute__((objc_precise_lifetime)) NSData *analyticalEngine = nil;
+    if (![selected fill:&raw clientIdentity:&clientIdentity
+            licenseKey:&licenseKey analyticalEngine:&analyticalEngine error:error]) {
         return nil;
     }
     NSData *encoded = PLKUtf8(path);
+    if (encoded == nil) {
+        PLKFail(error, PLKUnencodableText());
+        return nil;
+    }
     PotluckDbRevisionV1 rawRevision = [revision raw];
     __block PotluckDbSnapshotHandleV1 handle = 0;
     BOOL opened = [remote->_state withHandle:^BOOL(uint64_t remoteHandle,
@@ -1888,11 +2458,21 @@ static BOOL PLKRunTransaction(PLKHandleState *owner,
     return snapshot;
 }
 
-- (NSArray<NSArray *> *)query:(NSString *)sql
+- (PLKRows *)query:(NSString *)sql
                      bindings:(PLKBindings *)bindings
                         error:(NSError **)error {
-    return PLKRunQuery(_state, potluckdb_database_query_v1, sql, bindings,
-                       error);
+    return [self query:sql
+              bindings:bindings
+                engine:PLKQueryEngineSqlite
+                 error:error];
+}
+
+- (PLKRows *)query:(NSString *)sql
+                     bindings:(PLKBindings *)bindings
+                       engine:(PLKQueryEngine)engine
+                        error:(NSError **)error {
+    return PLKRunQuery(_state, potluckdb_database_query_with_engine_v1, sql, bindings,
+                       engine, error);
 }
 
 - (PLKExecuteResult *)execute:(NSString *)sql
@@ -1954,42 +2534,9 @@ static BOOL PLKRunTransaction(PLKHandleState *owner,
                       &failure, bodyError)) {
             return NO;
         }
-        result = [[PLKSyncResult alloc] init];
-        result->_outcome = (PLKSyncOutcome)output.kind;
-        BOOL converted = YES;
-        switch (output.kind) {
-            case POTLUCKDB_SYNC_UP_TO_DATE_V1:
-            case POTLUCKDB_SYNC_CONFLICT_V1:
-                if (output.has_revision != 0) {
-                    result->_revision =
-                        [PLKRevision revisionWithRaw:output.revision];
-                }
-                if (output.kind == POTLUCKDB_SYNC_CONFLICT_V1) {
-                    result->_conflictReason = PLKBufferString(output.reason);
-                }
-                break;
-            case POTLUCKDB_SYNC_PUSHED_V1:
-                result->_revision = [PLKRevision revisionWithRaw:output.revision];
-                break;
-            case POTLUCKDB_SYNC_PULLED_V1: {
-                result->_revision = [PLKRevision revisionWithRaw:output.revision];
-                result->_replayed = PLKCopyStrings(output.replayed, bodyError);
-                result->_quarantined =
-                    result->_replayed == nil
-                        ? nil
-                        : PLKCopyStrings(output.quarantined, bodyError);
-                converted = result->_quarantined != nil;
-                break;
-            }
-            default:
-                PLKFail(bodyError,
-                        PLKInternalFailure(
-                            @"potluckdb returned an unknown synchronization result"));
-                converted = NO;
-                break;
-        }
+        result = PLKSyncResultFromRaw(&output, bodyError);
         (void)potluckdb_sync_result_release_v1(&output);
-        return converted;
+        return result != nil;
     }
                                 error:error];
     return outcome ? result : nil;
@@ -2121,6 +2668,10 @@ static BOOL PLKRunTransaction(PLKHandleState *owner,
                     @"Supply a 32-byte key and retry."));
         return nil;
     }
+    if (!PLKRequireOpenedRemote(source, error) ||
+        !PLKRequireOpenedRemote(target, error)) {
+        return nil;
+    }
     if (source == target) {
         PLKFail(error,
                 PLKInvalidArgument(
@@ -2140,10 +2691,9 @@ static BOOL PLKRunTransaction(PLKHandleState *owner,
         options.revision = [revision raw];
     }
     __block PLKKeyRotationReport *report = nil;
-    BOOL outcome =
-        [source->_state withHandle:^BOOL(uint64_t left, NSError **bodyError) {
-            return [target->_state withHandle:^BOOL(uint64_t right,
-                                                    NSError **innerError) {
+    BOOL outcome = [source->_state
+        withPair:target->_state
+            body:^BOOL(uint64_t left, uint64_t right, NSError **bodyError) {
                 PotluckDbReencryptOptionsV1 callOptions = options;
                 PotluckDbKeyRotationReportV1 output;
                 potluckdb_key_rotation_report_init_v1(&output);
@@ -2152,7 +2702,7 @@ static BOOL PLKRunTransaction(PLKHandleState *owner,
                 if (!PLKCheck(potluckdb_admin_reencrypt_v1(
                                   left, right, &callOptions, &output,
                                   (uint32_t)sizeof(output), &failure),
-                              &failure, innerError)) {
+                              &failure, bodyError)) {
                     return NO;
                 }
                 report = [[PLKKeyRotationReport alloc] init];
@@ -2170,10 +2720,620 @@ static BOOL PLKRunTransaction(PLKHandleState *owner,
                 report->_published = output.published != 0;
                 return YES;
             }
-                                       error:bodyError];
-        }
-                             error:error];
+           error:error];
     return outcome ? report : nil;
+}
+
+@end
+
+// --- Remotes over object storage ---------------------------------------
+//
+// `PLKRemote remoteFromStorage:` above takes a bucket the application
+// implements. What follows takes a bucket nobody implements: the
+// semantics, the HTTP and every provider's credential chain live in
+// `potluckdb-storage`, one native library that every SDK loads, and all
+// this does is find it, hand it a JSON configuration, and give the
+// function table it answers with to `remoteFromStorage:`.
+//
+// Six of the functions below are deliberately not static. The
+// conformance beside this file links against them and drives them
+// directly, because the exact bytes of the document are the contract
+// with the library: a facade that spells a field wrong is invisible from
+// the outside until something is listening on the other end.
+
+enum { PLKStorageAbiVersionV1 = 1, PLKStorageOkV1 = 0 };
+
+// The storage library's own ABI, restated. It is in neither C header --
+// `potluckdb.h` is the application ABI and `potluckdb_runtime.h` is the
+// runtime interface -- because the storage library is a third thing,
+// loaded rather than linked. Every SDK restates these two structures.
+typedef struct {
+    const uint8_t *data;
+    uint64_t length;
+} PLKStorageSliceV1;
+
+typedef struct {
+    uint32_t struct_size;
+    uint32_t abi_version;
+    PLKStorageSliceV1 message;
+} PLKStorageErrorV1;
+
+typedef uint32_t (*PLKStorageAbiVersionFunction)(void);
+typedef uint32_t (*PLKStorageErrorSizeFunction)(void);
+typedef int32_t (*PLKStorageReleaseErrorFunction)(PLKStorageErrorV1 *);
+typedef int32_t (*PLKStorageReleaseAdapterFunction)(
+    const PotluckDbRuntimeBucketAdapterV1 *);
+typedef int32_t (*PLKStorageCreateFunction)(
+    PLKStorageSliceV1,
+    const PotluckDbRuntimeBucketAdapterV1 **,
+    PLKStorageErrorV1 *);
+
+typedef struct {
+    void *handle;
+    PLKStorageReleaseErrorFunction releaseError;
+    PLKStorageReleaseAdapterFunction releaseAdapter;
+} PLKStorageLibrary;
+
+/// Every provider the storage library builds, and the entry point that
+/// builds it.
+///
+/// Closed on purpose: a provider is not a string this SDK forwards to
+/// `dlsym`, it is one of three things the library is known to export. A
+/// name outside this map is refused here, before anything is loaded,
+/// rather than becoming a symbol lookup that fails in the loader's
+/// wording instead of this SDK's.
+NSDictionary<NSString *, NSString *> *PLKStorageEntryPoints(void) {
+    static NSDictionary<NSString *, NSString *> *entries;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        entries = @{
+            @"s3" : @"potluckdb_storage_s3_create_v1",
+            @"gcs" : @"potluckdb_storage_gcs_create_v1",
+            @"azure" : @"potluckdb_storage_azure_create_v1",
+        };
+    });
+    return entries;
+}
+
+static NSString *PLKStorageDefaultLibraryName(void) {
+#if defined(__APPLE__)
+    return @"libpotluckdb_storage.dylib";
+#else
+    return @"libpotluckdb_storage.so";
+#endif
+}
+
+/// Where the storage library is for this process.
+///
+/// `POTLUCKDB_STORAGE_LIBRARY` first, because someone who named a library
+/// meant that one. Then beside the running executable, and in the
+/// `Frameworks` directory of the bundle the executable is in, which is
+/// where an application's libraries ship -- there is no Objective-C
+/// equivalent of the `potluckdb-storage` wheel. Otherwise the platform's
+/// own name, which lets the loader search wherever it searches.
+///
+/// `getenv` rather than `NSProcessInfo`, whose environment dictionary is
+/// a snapshot: a process that set the variable on itself would read back
+/// what was there before it did.
+static NSString *PLKStorageLibraryPath(void) {
+    const char *named = getenv("POTLUCKDB_STORAGE_LIBRARY");
+    if (named != NULL && named[0] != '\0') {
+        NSString *decoded = [NSString stringWithUTF8String:named];
+        if (decoded.length > 0) {
+            return decoded;
+        }
+    }
+    NSString *name = PLKStorageDefaultLibraryName();
+    NSMutableArray<NSString *> *candidates = [NSMutableArray array];
+    NSURL *executable = NSBundle.mainBundle.executableURL;
+    NSString *beside =
+        [executable.URLByDeletingLastPathComponent URLByAppendingPathComponent:name].path;
+    if (beside != nil) {
+        [candidates addObject:beside];
+    }
+    NSString *framework = [NSBundle.mainBundle.privateFrameworksURL
+        URLByAppendingPathComponent:@"PotluckDBStorage.framework/PotluckDBStorage"].path;
+    if (framework != nil) {
+        [candidates addObject:framework];
+    }
+    NSString *frameworks =
+        [NSBundle.mainBundle.privateFrameworksURL URLByAppendingPathComponent:name].path;
+    if (frameworks != nil) {
+        [candidates addObject:frameworks];
+    }
+    for (NSString *candidate in candidates) {
+        if ([NSFileManager.defaultManager fileExistsAtPath:candidate]) {
+            return candidate;
+        }
+    }
+    return name;
+}
+
+static NSError *PLKStorageUnavailable(NSString *message) {
+    return PLKMakeError(
+        @"storage_library_unavailable", PLKErrorCategoryPermanent, message,
+        @"Ship libpotluckdb_storage inside the application bundle, or set "
+        @"POTLUCKDB_STORAGE_LIBRARY to one already on this machine.");
+}
+
+/// A provider this SDK has no entry point for.
+///
+/// Answered before the library is looked for, because the map above is
+/// this SDK's own knowledge and a caller who mistyped a provider should
+/// read that back rather than a complaint about an absent install.
+static NSError *PLKStorageUnknownProvider(NSString *provider) {
+    return PLKMakeError(
+        @"storage_library_unavailable", PLKErrorCategoryPermanent,
+        [NSString stringWithFormat:
+                      @"provider \"%@\" is not one this SDK can load. "
+                      @"The storage library provides \"s3\", \"gcs\", and "
+                      @"\"azure\".",
+                      provider],
+        @"Correct the provider name and retry.");
+}
+
+/// A provider this SDK knows, absent from the library it loaded.
+///
+/// The ordinary cause is an older storage library on the machine than the
+/// one this SDK was built against -- the provider was added after it was
+/// built -- so the remedy is the library, not the call.
+NSError *PLKStorageMissingEntryPoint(NSString *provider, NSString *symbol) {
+    return PLKMakeError(
+        @"storage_library_unavailable", PLKErrorCategoryPermanent,
+        [NSString stringWithFormat:
+                      @"the storage library does not export \"%@\". It may "
+                      @"predate provider \"%@\"; update the potluckdb storage "
+                      @"library.",
+                      symbol, provider],
+        @"Ship a libpotluckdb_storage matching this SDK's version.");
+}
+
+/// A symbol from an open library, copied into a function pointer.
+///
+/// Copied rather than cast: ISO C forbids converting an object pointer to
+/// a function pointer, and this file is compiled under `-Wpedantic
+/// -Werror` by its own conformance. An absent symbol arrives as NULL,
+/// which every caller checks.
+static void PLKStorageBind(void *handle, const char *name, void *destination) {
+    void *found = dlsym(handle, name);
+    memcpy(destination, &found, sizeof(found));
+}
+
+static NSString *PLKStorageLoaderReason(void) {
+    const char *reason = dlerror();
+    if (reason == NULL) {
+        return @"no reason was reported";
+    }
+    NSString *decoded = [NSString stringWithUTF8String:reason];
+    return decoded != nil ? decoded : @"no reason was reported";
+}
+
+static BOOL PLKStorageOpen(PLKStorageLibrary *out, NSString **reason) {
+    NSString *path = PLKStorageLibraryPath();
+    // Cleared first: `dlerror` reports the last failure whenever it was,
+    // so a stale one would be blamed on this call.
+    (void)dlerror();
+    void *handle = dlopen(path.UTF8String, RTLD_NOW);
+    if (handle == NULL) {
+        *reason = [NSString stringWithFormat:
+                                @"the storage library %@ did not load: %@", path,
+                                PLKStorageLoaderReason()];
+        return NO;
+    }
+
+    // Every symbol every provider needs, before any of them is used. A
+    // library that resolves three of four is not a usable library, and
+    // finding that out at the fourth call means finding it out with an
+    // adapter already built. The create functions are not here: those are
+    // one per provider, resolved when one is asked for.
+    PLKStorageAbiVersionFunction abiVersion = NULL;
+    PLKStorageErrorSizeFunction errorSize = NULL;
+    PLKStorageReleaseErrorFunction releaseError = NULL;
+    PLKStorageReleaseAdapterFunction releaseAdapter = NULL;
+    PLKStorageBind(handle, "potluckdb_storage_abi_version_v1", &abiVersion);
+    PLKStorageBind(handle, "potluckdb_storage_error_size_v1", &errorSize);
+    PLKStorageBind(handle, "potluckdb_storage_error_release_v1", &releaseError);
+    PLKStorageBind(handle, "potluckdb_storage_release_v1", &releaseAdapter);
+    NSDictionary<NSString *, NSNumber *> *mandatory = @{
+        @"potluckdb_storage_abi_version_v1" : @(abiVersion != NULL),
+        @"potluckdb_storage_error_size_v1" : @(errorSize != NULL),
+        @"potluckdb_storage_error_release_v1" : @(releaseError != NULL),
+        @"potluckdb_storage_release_v1" : @(releaseAdapter != NULL),
+    };
+    for (NSString *symbol in mandatory) {
+        if (mandatory[symbol].boolValue) {
+            continue;
+        }
+        *reason = [NSString
+            stringWithFormat:@"the storage library %@ does not export %@", path,
+                             symbol];
+        return NO;
+    }
+
+    // Checked before anything crosses, not after something goes wrong: a
+    // library from another release would fill a structure this file reads
+    // at different offsets, and the first symptom would be a nonsense
+    // error message rather than a refusal.
+    uint32_t version = abiVersion();
+    if (version != (uint32_t)PLKStorageAbiVersionV1) {
+        *reason = [NSString stringWithFormat:
+                                @"the storage library at %@ speaks ABI %u, not %u",
+                                path, version, (uint32_t)PLKStorageAbiVersionV1];
+        return NO;
+    }
+    if (errorSize() != (uint32_t)sizeof(PLKStorageErrorV1)) {
+        *reason = [NSString
+            stringWithFormat:
+                @"the storage library at %@ declares a different error structure",
+                path];
+        return NO;
+    }
+    out->handle = handle;
+    out->releaseError = releaseError;
+    out->releaseAdapter = releaseAdapter;
+    return YES;
+}
+
+/// The storage library for this process, opened at most once.
+///
+/// Never closed, because every table it handed out points into its code
+/// and there is no moment at which the last one is known to be gone. The
+/// refusal is remembered too, so a second call answers as the first did
+/// rather than retrying a load already shown not to work.
+static const PLKStorageLibrary *PLKStorageLoad(NSError **error) {
+    static PLKStorageLibrary loaded;
+    static BOOL opened;
+    static NSString *refused;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSString *reason = nil;
+        opened = PLKStorageOpen(&loaded, &reason);
+        refused = reason;
+    });
+    if (opened) {
+        return &loaded;
+    }
+    PLKFail(error, PLKStorageUnavailable(refused));
+    return NULL;
+}
+
+/// One adapter table, given back to the library that built it.
+///
+/// The runtime copies the table but keeps its `context` pointer for the
+/// life of the exchange, so the release has to come after the exchange is
+/// closed and released. Being what the remote's handle state retains is
+/// what arranges that: the state closes, releases, and only then lets ARC
+/// drop what it holds. An exchange that never opened is given back by
+/// hand instead, which is the same rule read from the other end.
+@interface PLKStoragePackAdapter : NSObject
+@end
+
+@implementation PLKStoragePackAdapter {
+    const PLKStorageLibrary *_library;
+    const PotluckDbRuntimeBucketAdapterV1 *_table;
+}
+
+- (instancetype)initWithLibrary:(const PLKStorageLibrary *)library
+                          table:(const PotluckDbRuntimeBucketAdapterV1 *)table {
+    self = [super init];
+    if (self != nil) {
+        _library = library;
+        _table = table;
+    }
+    return self;
+}
+
+/// Hand the table back, at most once.
+- (void)giveBack {
+    if (_table == NULL) {
+        return;
+    }
+    const PotluckDbRuntimeBucketAdapterV1 *table = _table;
+    _table = NULL;
+    (void)_library->releaseAdapter(table);
+}
+
+- (void)dealloc {
+    [self giveBack];
+}
+
+@end
+
+/// A remote over whichever provider's adapter the library builds.
+///
+/// The one place this SDK crosses into the storage library. Everything
+/// that is not the provider -- the handshake, the ownership of the
+/// adapter across the exchange, the refusal the library answers a bad
+/// configuration with -- is the same for all three, so it is written once
+/// here and each facade supplies only its own document.
+PLKRemote *_Nullable PLKStorageRemoteFromProvider(
+    NSString *provider,
+    NSDictionary<NSString *, id> *document,
+    PLKRemoteOptions *_Nullable options,
+    NSError **error) {
+    NSString *symbol = PLKStorageEntryPoints()[provider];
+    if (symbol == nil) {
+        PLKFail(error, PLKStorageUnknownProvider(provider));
+        return nil;
+    }
+    const PLKStorageLibrary *library = PLKStorageLoad(error);
+    if (library == NULL) {
+        return nil;
+    }
+    PLKStorageCreateFunction create = NULL;
+    PLKStorageBind(library->handle, symbol.UTF8String, &create);
+    if (create == NULL) {
+        PLKFail(error, PLKStorageMissingEntryPoint(provider, symbol));
+        return nil;
+    }
+
+    NSError *encodingFailure = nil;
+    // Sorted so the bytes are the same on every run: a dictionary has no
+    // order of its own, and the document is both what the library parses
+    // and what this SDK's conformance compares.
+    NSData *encoded =
+        [NSJSONSerialization dataWithJSONObject:document
+                                        options:NSJSONWritingSortedKeys
+                                          error:&encodingFailure];
+    if (encoded == nil) {
+        PLKFail(error, PLKInternalFailure([NSString
+                           stringWithFormat:@"the storage configuration could "
+                                            @"not be encoded: %@",
+                                            encodingFailure.localizedDescription]));
+        return nil;
+    }
+
+    PLKStorageSliceV1 slice = {0};
+    if (encoded.length > 0) {
+        slice.data = encoded.bytes;
+        slice.length = encoded.length;
+    }
+    const PotluckDbRuntimeBucketAdapterV1 *table = NULL;
+    PLKStorageErrorV1 reported = {0};
+    reported.struct_size = (uint32_t)sizeof(PLKStorageErrorV1);
+    reported.abi_version = (uint32_t)PLKStorageAbiVersionV1;
+    int32_t code = create(slice, &table, &reported);
+    if (code != PLKStorageOkV1) {
+        // Copied before the release, which is what hands the bytes back:
+        // a message read afterwards is a read of memory that is no longer
+        // ours.
+        NSString *message = @"the storage library refused the configuration";
+        if (reported.message.data != NULL && reported.message.length > 0) {
+            NSString *decoded = [[NSString alloc]
+                initWithBytes:reported.message.data
+                       length:(NSUInteger)reported.message.length
+                     encoding:NSUTF8StringEncoding];
+            if (decoded != nil) {
+                message = decoded;
+            }
+        }
+        (void)library->releaseError(&reported);
+        if (code == 24) {
+            PLKFail(error, PLKMakeError(@"bucket_not_found", PLKErrorCategoryPermanent,
+                message, @"Create the bucket or container, or correct the name the remote was configured with."));
+            return nil;
+        }
+        PLKFail(error,
+                PLKInvalidArgument(
+                    message, @"Correct the storage configuration and retry."));
+        return nil;
+    }
+    if (table == NULL) {
+        PLKFail(error, PLKStorageUnavailable(
+                           @"the storage library built no adapter and reported "
+                           @"no reason"));
+        return nil;
+    }
+
+    PLKStoragePackAdapter *owner =
+        [[PLKStoragePackAdapter alloc] initWithLibrary:library table:table];
+    PLKStorageAdapter *adapter =
+        [PLKStorageAdapter adapterRetainingPointer:(void *)table
+                                             owner:owner
+                                             error:error];
+    if (adapter == nil) {
+        [owner giveBack];
+        return nil;
+    }
+    PLKRemote *remote = [PLKRemote remoteFromStorage:adapter
+                                             options:options
+                                               error:error];
+    if (remote == nil) {
+        // The exchange never opened, so it is not holding the table: it
+        // goes back now rather than waiting for a close that never comes.
+        [owner giveBack];
+        return nil;
+    }
+    return remote;
+}
+
+/// Whitespace, or nothing at all.
+static BOOL PLKStorageBlank(NSString *value) {
+    NSCharacterSet *whitespace =
+        [NSCharacterSet whitespaceAndNewlineCharacterSet];
+    return [value stringByTrimmingCharactersInSet:whitespace].length == 0;
+}
+
+NSDictionary<NSString *, id> *_Nullable PLKStorageS3Document(
+    NSString *bucket,
+    NSString *databaseNamespace,
+    NSString *_Nullable region,
+    NSString *_Nullable endpoint,
+    BOOL forcePathStyle,
+    NSString *_Nullable accessKeyID,
+    NSString *_Nullable secretAccessKey,
+    NSString *_Nullable sessionToken,
+    NSError **error) {
+    if ((accessKeyID != nil) != (secretAccessKey != nil)) {
+        // Half a credential is not a credential and is not an absent one
+        // either: taken as absent, the chain would answer with somebody
+        // else's keys and the failure would name a permission.
+        PLKFail(error,
+                PLKInvalidArgument(
+                    @"access_key_id and secret_access_key are given together "
+                    @"or not at all",
+                    @"Pass both to use explicit credentials, or neither for "
+                    @"the AWS chain."));
+        return nil;
+    }
+    NSMutableDictionary<NSString *, id> *credentials =
+        [NSMutableDictionary dictionaryWithObject:@"ambient" forKey:@"mode"];
+    if (accessKeyID != nil && secretAccessKey != nil) {
+        credentials[@"mode"] = @"explicit";
+        credentials[@"access_key_id"] = accessKeyID;
+        credentials[@"secret_access_key"] = secretAccessKey;
+        if (sessionToken != nil) {
+            credentials[@"session_token"] = sessionToken;
+        }
+    }
+    NSMutableDictionary<NSString *, id> *document = [@{
+        @"provider" : @"s3",
+        @"bucket" : bucket,
+        @"namespace" : databaseNamespace,
+        @"force_path_style" : @(forcePathStyle),
+        @"credentials" : credentials,
+    } mutableCopy];
+    if (region != nil) {
+        document[@"region"] = region;
+    }
+    if (endpoint != nil) {
+        document[@"endpoint"] = endpoint;
+    }
+    return document;
+}
+
+NSDictionary<NSString *, id> *_Nullable PLKStorageGCSDocument(
+    NSString *bucket,
+    NSString *databaseNamespace,
+    NSString *_Nullable endpoint,
+    NSString *_Nullable serviceAccount,
+    NSError **error) {
+    NSMutableDictionary<NSString *, id> *credentials =
+        [NSMutableDictionary dictionaryWithObject:@"ambient" forKey:@"mode"];
+    if (serviceAccount != nil) {
+        // An empty key is not a key and is not an absent one either: taken
+        // as absent, the chain would answer with whatever identity the
+        // machine carries and the failure would name a permission.
+        if (PLKStorageBlank(serviceAccount)) {
+            PLKFail(error,
+                    PLKInvalidArgument(
+                        @"service_account is a key or is absent, and is never "
+                        @"empty",
+                        @"Pass the service account JSON, or nothing for the "
+                        @"Google chain."));
+            return nil;
+        }
+        credentials[@"mode"] = @"explicit";
+        // The key crosses as the text Google issues, carried inside one
+        // JSON string: the library reads the account itself, so this file
+        // never parses it and never re-emits it field by field.
+        credentials[@"service_account"] = serviceAccount;
+    }
+    NSMutableDictionary<NSString *, id> *document = [@{
+        @"provider" : @"gcs",
+        @"bucket" : bucket,
+        @"namespace" : databaseNamespace,
+        @"credentials" : credentials,
+    } mutableCopy];
+    if (endpoint != nil) {
+        document[@"endpoint"] = endpoint;
+    }
+    return document;
+}
+
+NSDictionary<NSString *, id> *_Nullable PLKStorageAzureDocument(
+    NSString *account,
+    NSString *container,
+    NSString *databaseNamespace,
+    NSString *_Nullable endpoint,
+    NSString *_Nullable accountKey,
+    NSError **error) {
+    NSMutableDictionary<NSString *, id> *credentials =
+        [NSMutableDictionary dictionaryWithObject:@"ambient" forKey:@"mode"];
+    if (accountKey != nil) {
+        // An empty key is not a key and is not an absent one either: taken
+        // as absent, the chain would answer with whatever identity the
+        // machine carries and the failure would name a permission.
+        if (PLKStorageBlank(accountKey)) {
+            PLKFail(error,
+                    PLKInvalidArgument(
+                        @"account_key is a key or is absent, and is never "
+                        @"empty",
+                        @"Pass the account key, or nothing for the Azure "
+                        @"chain."));
+            return nil;
+        }
+        credentials[@"mode"] = @"explicit";
+        credentials[@"account_key"] = accountKey;
+    }
+    NSMutableDictionary<NSString *, id> *document = [@{
+        @"provider" : @"azure",
+        @"account" : account,
+        @"container" : container,
+        @"namespace" : databaseNamespace,
+        @"credentials" : credentials,
+    } mutableCopy];
+    if (endpoint != nil) {
+        // `endpoint` is what every facade calls it and `endpoint_url` is
+        // what the library reads; the rename happens here so that one
+        // spelling reaches callers across all three providers.
+        document[@"endpoint_url"] = endpoint;
+    }
+    return document;
+}
+
+@implementation PLKStorage
+
++ (PLKRemote *)remoteFromS3Bucket:(NSString *)bucket
+                      inNamespace:(NSString *)databaseNamespace
+                           region:(NSString *)region
+                         endpoint:(NSString *)endpoint
+                   forcePathStyle:(BOOL)forcePathStyle
+                      accessKeyID:(NSString *)accessKeyID
+                  secretAccessKey:(NSString *)secretAccessKey
+                     sessionToken:(NSString *)sessionToken
+                          options:(PLKRemoteOptions *)options
+                            error:(NSError **)error {
+    NSDictionary<NSString *, id> *document = PLKStorageS3Document(
+        bucket, databaseNamespace, region, endpoint, forcePathStyle,
+        accessKeyID, secretAccessKey, sessionToken, error);
+    if (document == nil) {
+        return nil;
+    }
+    return PLKStorageRemoteFromProvider(@"s3", document, options, error);
+}
+
++ (PLKRemote *)remoteFromGCSBucket:(NSString *)bucket
+                       inNamespace:(NSString *)databaseNamespace
+                          endpoint:(NSString *)endpoint
+                    serviceAccount:(NSString *)serviceAccount
+                           options:(PLKRemoteOptions *)options
+                             error:(NSError **)error {
+    NSDictionary<NSString *, id> *document = PLKStorageGCSDocument(
+        bucket, databaseNamespace, endpoint, serviceAccount, error);
+    if (document == nil) {
+        return nil;
+    }
+    return PLKStorageRemoteFromProvider(@"gcs", document, options, error);
+}
+
++ (PLKRemote *)remoteFromAzureAccount:(NSString *)account
+                            container:(NSString *)container
+                          inNamespace:(NSString *)databaseNamespace
+                             endpoint:(NSString *)endpoint
+                           accountKey:(NSString *)accountKey
+                              options:(PLKRemoteOptions *)options
+                                error:(NSError **)error {
+    NSDictionary<NSString *, id> *document = PLKStorageAzureDocument(
+        account, container, databaseNamespace, endpoint, accountKey, error);
+    if (document == nil) {
+        return nil;
+    }
+    return PLKStorageRemoteFromProvider(@"azure", document, options, error);
+}
+
++ (NSString *)libraryPath {
+    return PLKStorageLibraryPath();
 }
 
 @end
